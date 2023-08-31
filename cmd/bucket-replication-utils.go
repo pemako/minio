@@ -49,6 +49,9 @@ type replicatedTargetInfo struct {
 	VersionPurgeStatus    VersionPurgeStatusType
 	ResyncTimestamp       string
 	ReplicationResynced   bool // true only if resync attempted for this target
+	endpoint              string
+	secure                bool
+	Err                   error // replication error if any
 }
 
 // Empty returns true for a target if arn is empty
@@ -320,7 +323,7 @@ func parseReplicateDecision(ctx context.Context, bucket, s string) (r ReplicateD
 		if err != nil {
 			return r, err
 		}
-		tgtClnt := globalBucketTargetSys.GetRemoteTargetClient(ctx, slc[0])
+		tgtClnt := globalBucketTargetSys.GetRemoteTargetClient(slc[0])
 		if tgtClnt == nil {
 			// Skip stale targets if any and log them to be missing atleast once.
 			logger.LogOnceIf(ctx, fmt.Errorf("failed to get target for bucket:%s arn:%s", bucket, slc[0]), slc[0])
@@ -349,8 +352,6 @@ type ReplicationState struct {
 // Equal returns true if replication state is identical for version purge statuses and (replica)tion statuses.
 func (rs *ReplicationState) Equal(o ReplicationState) bool {
 	return rs.ReplicaStatus == o.ReplicaStatus &&
-		rs.ReplicaTimeStamp.Equal(o.ReplicaTimeStamp) &&
-		rs.ReplicationTimeStamp.Equal(o.ReplicationTimeStamp) &&
 		rs.ReplicationStatusInternal == o.ReplicationStatusInternal &&
 		rs.VersionPurgeStatusInternal == o.VersionPurgeStatusInternal
 }
@@ -366,7 +367,10 @@ func (rs *ReplicationState) CompositeReplicationStatus() (st replication.StatusT
 			replStatus := getCompositeReplicationStatus(rs.Targets)
 			// return REPLICA status if replica received timestamp is later than replication timestamp
 			// provided object replication completed for all targets.
-			if !rs.ReplicaTimeStamp.Equal(timeSentinel) && replStatus == replication.Completed && rs.ReplicaTimeStamp.After(rs.ReplicationTimeStamp) {
+			if rs.ReplicaTimeStamp.Equal(timeSentinel) || rs.ReplicaTimeStamp.IsZero() {
+				return replStatus
+			}
+			if replStatus == replication.Completed && rs.ReplicaTimeStamp.After(rs.ReplicationTimeStamp) {
 				return rs.ReplicaStatus
 			}
 			return replStatus
@@ -799,6 +803,7 @@ type MRFReplicateEntry struct {
 	Object     string `json:"object" msg:"o"`
 	versionID  string `json:"-"`
 	RetryCount int    `json:"retryCount" msg:"rc"`
+	sz         int64  `json:"-"`
 }
 
 // MRFReplicateEntries has the map of MRF entries to save to disk
@@ -813,17 +818,7 @@ func (ri ReplicateObjectInfo) ToMRFEntry() MRFReplicateEntry {
 		Bucket:     ri.Bucket,
 		Object:     ri.Name,
 		versionID:  ri.VersionID,
+		sz:         ri.Size,
 		RetryCount: int(ri.RetryCount),
 	}
 }
-
-func getReplicationStatsPath() string {
-	return bucketMetaPrefix + SlashSeparator + replicationDir + SlashSeparator + "replication.stats"
-}
-
-const (
-	replStatsMetaFormat   = 1
-	replStatsVersionV1    = 1
-	replStatsVersion      = replStatsVersionV1
-	replStatsSaveInterval = time.Minute * 5
-)
