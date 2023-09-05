@@ -43,9 +43,9 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/mimedb"
-	"github.com/minio/pkg/sync/errgroup"
-	"github.com/minio/pkg/wildcard"
+	"github.com/minio/pkg/v2/mimedb"
+	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v2/wildcard"
 	uatomic "go.uber.org/atomic"
 )
 
@@ -93,7 +93,7 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	if srcOpts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, storageDisks, srcBucket, srcObject, srcOpts.VersionID, true)
 	} else {
-		metaArr, errs = readAllXL(ctx, storageDisks, srcBucket, srcObject, true, false)
+		metaArr, errs = readAllXL(ctx, storageDisks, srcBucket, srcObject, true, false, true)
 	}
 
 	readQuorum, writeQuorum, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
@@ -533,7 +533,7 @@ func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object st
 	return m, err
 }
 
-func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, readData, inclFreeVers bool) ([]FileInfo, []error) {
+func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, readData, inclFreeVers, allParts bool) ([]FileInfo, []error) {
 	metadataArray := make([]*xlMetaV2, len(disks))
 	metaFileInfos := make([]FileInfo, len(metadataArray))
 	metadataShallowVersions := make([][]xlMetaV2ShallowVersion, len(disks))
@@ -601,7 +601,7 @@ func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, r
 
 	readQuorum := (len(disks) + 1) / 2
 	meta := &xlMetaV2{versions: mergeXLV2Versions(readQuorum, false, 1, metadataShallowVersions...)}
-	lfi, err := meta.ToFileInfo(bucket, object, "", inclFreeVers)
+	lfi, err := meta.ToFileInfo(bucket, object, "", inclFreeVers, allParts)
 	if err != nil {
 		for i := range errs {
 			if errs[i] == nil {
@@ -631,7 +631,7 @@ func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, r
 
 		// make sure to preserve this for diskmtime based healing bugfix.
 		diskMTime := metaFileInfos[index].DiskMTime
-		metaFileInfos[index], errs[index] = metadataArray[index].ToFileInfo(bucket, object, versionID, inclFreeVers)
+		metaFileInfos[index], errs[index] = metadataArray[index].ToFileInfo(bucket, object, versionID, inclFreeVers, allParts)
 		if errs[index] != nil {
 			continue
 		}
@@ -660,7 +660,7 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	if opts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, readData)
 	} else {
-		metaArr, errs = readAllXL(ctx, disks, bucket, object, readData, opts.InclFreeVersions)
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, readData, opts.InclFreeVersions, true)
 	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
@@ -960,11 +960,6 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 		}
 		partsMetadata[i].Data = inlineBuffers[i].Bytes()
 		partsMetadata[i].AddObjectPart(1, "", n, data.ActualSize(), modTime, index, nil)
-		partsMetadata[i].Erasure.AddChecksumInfo(ChecksumInfo{
-			PartNumber: 1,
-			Algorithm:  DefaultBitrotAlgorithm,
-			Hash:       bitrotWriterSum(w),
-		})
 	}
 
 	// Fill all the necessary metadata.
@@ -1296,11 +1291,6 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		}
 		// No need to add checksum to part. We already have it on the object.
 		partsMetadata[i].AddObjectPart(1, "", n, data.ActualSize(), modTime, compIndex, nil)
-		partsMetadata[i].Erasure.AddChecksumInfo(ChecksumInfo{
-			PartNumber: 1,
-			Algorithm:  DefaultBitrotAlgorithm,
-			Hash:       bitrotWriterSum(w),
-		})
 		partsMetadata[i].Versioned = opts.Versioned || opts.VersionSuspended
 	}
 
@@ -1844,7 +1834,7 @@ func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object s
 	if opts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false)
 	} else {
-		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false)
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false, true)
 	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
@@ -1917,7 +1907,7 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 	if opts.VersionID != "" {
 		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false)
 	} else {
-		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false)
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false, true)
 	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)

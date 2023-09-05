@@ -29,7 +29,7 @@ import (
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/sync/errgroup"
+	"github.com/minio/pkg/v2/sync/errgroup"
 )
 
 const reservedMetadataPrefixLowerDataShardFix = ReservedMetadataPrefixLower + "data-shard-fix"
@@ -714,11 +714,6 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 
 				partsMetadata[i].DataDir = dstDataDir
 				partsMetadata[i].AddObjectPart(partNumber, "", partSize, partActualSize, partModTime, partIdx, partChecksums)
-				partsMetadata[i].Erasure.AddChecksumInfo(ChecksumInfo{
-					PartNumber: partNumber,
-					Algorithm:  checksumAlgo,
-					Hash:       bitrotWriterSum(writers[i]),
-				})
 				if len(inlineBuffers) > 0 && inlineBuffers[i] != nil {
 					partsMetadata[i].Data = inlineBuffers[i].Bytes()
 					partsMetadata[i].SetInlineData()

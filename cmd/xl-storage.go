@@ -193,9 +193,6 @@ func getValidPath(path string) (string, error) {
 func isDirEmpty(dirname string) bool {
 	entries, err := readDirN(dirname, 1)
 	if err != nil {
-		if err != errFileNotFound {
-			logger.LogIf(GlobalContext, err)
-		}
 		return false
 	}
 	return len(entries) == 0
@@ -531,7 +528,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 		// Remove filename which is the meta file.
 		item.transformMetaDir()
 
-		fivs, err := getFileInfoVersions(buf, item.bucket, item.objectPath())
+		fivs, err := getFileInfoVersions(buf, item.bucket, item.objectPath(), false)
 		metaDataPoolPut(buf)
 		if err != nil {
 			res["err"] = err.Error()
@@ -707,12 +704,12 @@ func (s *xlStorage) checkFormatJSON() (os.FileInfo, error) {
 			} else if osIsPermission(err) {
 				return nil, errDiskAccessDenied
 			}
-			logger.LogOnceIf(GlobalContext, err, err.Error()) // log unexpected errors
+			logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
 			return nil, errCorruptedFormat
 		} else if osIsPermission(err) {
 			return nil, errDiskAccessDenied
 		}
-		logger.LogOnceIf(GlobalContext, err, err.Error()) // log unexpected errors
+		logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
 		return nil, errCorruptedFormat
 	}
 	return fi, nil
@@ -759,19 +756,19 @@ func (s *xlStorage) GetDiskID() (string, error) {
 			} else if osIsPermission(err) {
 				return "", errDiskAccessDenied
 			}
-			logger.LogIf(GlobalContext, err) // log unexpected errors
+			logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
 			return "", errCorruptedFormat
 		} else if osIsPermission(err) {
 			return "", errDiskAccessDenied
 		}
-		logger.LogIf(GlobalContext, err) // log unexpected errors
+		logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
 		return "", errCorruptedFormat
 	}
 
 	format := &formatErasureV3{}
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err = json.Unmarshal(b, &format); err != nil {
-		logger.LogIf(GlobalContext, err) // log unexpected errors
+		logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
 		return "", errCorruptedFormat
 	}
 
@@ -843,7 +840,6 @@ func listVols(ctx context.Context, dirPath string) ([]VolInfo, error) {
 	}
 	entries, err := readDir(dirPath)
 	if err != nil {
-		logger.LogIf(ctx, err)
 		if errors.Is(err, errFileAccessDenied) {
 			return nil, errDiskAccessDenied
 		} else if errors.Is(err, errFileNotFound) {
@@ -1240,7 +1236,6 @@ func (s *xlStorage) UpdateMetadata(ctx context.Context, volume, path string, fi 
 
 	var xlMeta xlMetaV2
 	if err = xlMeta.Load(buf); err != nil {
-		logger.LogIf(ctx, err)
 		return err
 	}
 
@@ -1262,13 +1257,11 @@ func (s *xlStorage) WriteMetadata(ctx context.Context, volume, path string, fi F
 	if fi.Fresh {
 		var xlMeta xlMetaV2
 		if err := xlMeta.AddVersion(fi); err != nil {
-			logger.LogIf(ctx, err)
 			return err
 		}
 		buf, err := xlMeta.AppendTo(metaDataPoolGet())
 		defer metaDataPoolPut(buf)
 		if err != nil {
-			logger.LogIf(ctx, err)
 			return err
 		}
 		// First writes for special situations do not write to stable storage.
@@ -1287,34 +1280,28 @@ func (s *xlStorage) WriteMetadata(ctx context.Context, volume, path string, fi F
 	var xlMeta xlMetaV2
 	if !isXL2V1Format(buf) {
 		// This is both legacy and without proper version.
-		err = xlMeta.AddVersion(fi)
-		if err != nil {
-			logger.LogIf(ctx, err)
+		if err = xlMeta.AddVersion(fi); err != nil {
 			return err
 		}
 
 		buf, err = xlMeta.AppendTo(metaDataPoolGet())
 		defer metaDataPoolPut(buf)
 		if err != nil {
-			logger.LogIf(ctx, err)
 			return err
 		}
 	} else {
 		if err = xlMeta.Load(buf); err != nil {
-			logger.LogIf(ctx, err)
 			// Corrupted data, reset and write.
 			xlMeta = xlMetaV2{}
 		}
 
 		if err = xlMeta.AddVersion(fi); err != nil {
-			logger.LogIf(ctx, err)
 			return err
 		}
 
 		buf, err = xlMeta.AppendTo(metaDataPoolGet())
 		defer metaDataPoolPut(buf)
 		if err != nil {
-			logger.LogIf(ctx, err)
 			return err
 		}
 	}
@@ -1450,7 +1437,7 @@ func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID str
 		return fi, err
 	}
 
-	fi, err = getFileInfo(buf, volume, path, versionID, readData)
+	fi, err = getFileInfo(buf, volume, path, versionID, readData, true)
 	if err != nil {
 		return fi, err
 	}
@@ -2336,7 +2323,6 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	if len(dstBuf) > 0 {
 		if isXL2V1Format(dstBuf) {
 			if err = xlMeta.Load(dstBuf); err != nil {
-				logger.LogIf(ctx, err)
 				// Data appears corrupt. Drop data.
 				xlMeta = xlMetaV2{}
 			}
@@ -2424,7 +2410,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	// Replace the data of null version or any other existing version-id
-	ofi, err := xlMeta.ToFileInfo(dstVolume, dstPath, reqVID, false)
+	ofi, err := xlMeta.ToFileInfo(dstVolume, dstPath, reqVID, false, false)
 	if err == nil && !ofi.Deleted {
 		if xlMeta.SharedDataDirCountStr(reqVID, ofi.DataDir) == 0 {
 			// Purge the destination path as we are not preserving anything
@@ -2478,7 +2464,6 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	dstBuf, err = xlMeta.AppendTo(metaDataPoolGet())
 	defer metaDataPoolPut(dstBuf)
 	if err != nil {
-		logger.LogIf(ctx, err)
 		if legacyPreserved {
 			// Any failed rename calls un-roll previous transaction.
 			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
@@ -2690,9 +2675,11 @@ func (s *xlStorage) VerifyFile(ctx context.Context, volume, path string, fi File
 				errFileNotFound,
 				errVolumeNotFound,
 				errFileCorrupt,
+				errFileAccessDenied,
+				errFileVersionNotFound,
 			}...) {
 				logger.GetReqInfo(ctx).AppendTags("disk", s.String())
-				logger.LogIf(ctx, err)
+				logger.LogOnceIf(ctx, err, partPath)
 			}
 			return err
 		}
