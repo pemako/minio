@@ -702,10 +702,8 @@ func getCopyObjMetadata(oi ObjectInfo, sc string) map[string]string {
 		meta[xhttp.ContentType] = oi.ContentType
 	}
 
-	if oi.UserTags != "" {
-		meta[xhttp.AmzObjectTagging] = oi.UserTags
-		meta[xhttp.AmzTagDirective] = "REPLACE"
-	}
+	meta[xhttp.AmzObjectTagging] = oi.UserTags
+	meta[xhttp.AmzTagDirective] = "REPLACE"
 
 	if sc == "" {
 		sc = oi.StorageClass
@@ -887,7 +885,7 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 	}
 
 	t, _ := tags.ParseObjectTags(oi1.UserTags)
-	if !reflect.DeepEqual(oi2.UserTags, t.ToMap()) || (oi2.UserTagCount != len(t.ToMap())) {
+	if (oi2.UserTagCount > 0 && !reflect.DeepEqual(oi2.UserTags, t.ToMap())) || (oi2.UserTagCount != len(t.ToMap())) {
 		return replicateMetadata
 	}
 
@@ -1217,8 +1215,10 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 	}
 
 	opts := &bandwidth.MonitorReaderOptions{
-		Bucket:     objInfo.Bucket,
-		TargetARN:  tgt.ARN,
+		BucketOptions: bandwidth.BucketOptions{
+			Name:           objInfo.Bucket,
+			ReplicationARN: tgt.ARN,
+		},
 		HeaderSize: headerSize,
 	}
 	newCtx := ctx
@@ -1456,8 +1456,10 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 		}
 
 		opts := &bandwidth.MonitorReaderOptions{
-			Bucket:     objInfo.Bucket,
-			TargetARN:  tgt.ARN,
+			BucketOptions: bandwidth.BucketOptions{
+				Name:           objInfo.Bucket,
+				ReplicationARN: tgt.ARN,
+			},
 			HeaderSize: headerSize,
 		}
 		newCtx := ctx
@@ -2527,6 +2529,13 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 	workers := make([]chan ReplicateObjectInfo, resyncParallelRoutines)
 	resultCh := make(chan TargetReplicationResyncStatus, 1)
 	defer close(resultCh)
+	go func() {
+		for r := range resultCh {
+			s.incStats(r, opts)
+			globalSiteResyncMetrics.updateMetric(r, opts.resyncID)
+		}
+	}()
+
 	var wg sync.WaitGroup
 	for i := 0; i < resyncParallelRoutines; i++ {
 		wg.Add(1)
@@ -2631,12 +2640,6 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 	for i := 0; i < resyncParallelRoutines; i++ {
 		close(workers[i])
 	}
-	go func() {
-		for r := range resultCh {
-			s.incStats(r, opts)
-			globalSiteResyncMetrics.updateMetric(r, opts.resyncID)
-		}
-	}()
 	wg.Wait()
 	resyncStatus = ResyncCompleted
 }
