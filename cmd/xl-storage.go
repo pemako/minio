@@ -114,6 +114,8 @@ type xlStorage struct {
 
 	formatData []byte
 
+	nrRequests uint64
+
 	// mutex to prevent concurrent read operations overloading walks.
 	rotational bool
 	walkMu     *sync.Mutex
@@ -242,6 +244,11 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
 		poolIndex:  -1,
 		setIndex:   -1,
 		diskIndex:  -1,
+	}
+
+	// Sanitize before setting it
+	if info.NRRequests > 0 {
+		s.nrRequests = info.NRRequests
 	}
 
 	// We stagger listings only on HDDs.
@@ -658,6 +665,7 @@ func (s *xlStorage) DiskInfo(_ context.Context, _ bool) (info DiskInfo, err erro
 			dcinfo.UsedInodes = di.Files - di.Ffree
 			dcinfo.FreeInodes = di.Ffree
 			dcinfo.FSType = di.FSType
+			dcinfo.NRRequests = s.nrRequests
 			dcinfo.Rotational = s.rotational
 			diskID, err := s.GetDiskID()
 			// Healing is 'true' when
@@ -1782,7 +1790,7 @@ func (s *xlStorage) ReadFileStream(ctx context.Context, volume, path string, off
 		return nil, err
 	}
 
-	odirectEnabled := globalAPIConfig.odirectEnabled() && s.oDirect
+	odirectEnabled := globalAPIConfig.odirectEnabled() && s.oDirect && length >= 0
 
 	var file *os.File
 	if odirectEnabled {
@@ -1812,6 +1820,10 @@ func (s *xlStorage) ReadFileStream(ctx context.Context, volume, path string, off
 		default:
 			return nil, err
 		}
+	}
+
+	if length < 0 {
+		return file, nil
 	}
 
 	st, err := file.Stat()
@@ -1881,10 +1893,6 @@ func (c closeWrapper) Close() error {
 
 // CreateFile - creates the file.
 func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) (err error) {
-	if fileSize < -1 {
-		return errInvalidArgument
-	}
-
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return err
@@ -1921,7 +1929,7 @@ func (s *xlStorage) writeAllDirect(ctx context.Context, filePath string, fileSiz
 		return osErrToFileErr(err)
 	}
 
-	odirectEnabled := globalAPIConfig.odirectEnabled() && s.oDirect
+	odirectEnabled := globalAPIConfig.odirectEnabled() && s.oDirect && fileSize > 0
 
 	var w *os.File
 	if odirectEnabled {
