@@ -143,6 +143,12 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 
 	z.decommissionCancelers = make([]context.CancelFunc, len(z.serverPools))
 
+	// Initialize the pool meta, but set it to not save.
+	// When z.Init below has loaded the poolmeta will be initialized,
+	// and allowed to save.
+	z.poolMeta = newPoolMeta(z, poolMeta{})
+	z.poolMeta.dontSave = true
+
 	// initialize the object layer.
 	setObjectLayer(z)
 
@@ -2451,12 +2457,12 @@ func (z *erasureServerPools) GetObjectTags(ctx context.Context, bucket, object s
 		return z.serverPools[0].GetObjectTags(ctx, bucket, object, opts)
 	}
 
-	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
+	oi, _, err := z.getLatestObjectInfoWithIdx(ctx, bucket, object, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	return z.serverPools[idx].GetObjectTags(ctx, bucket, object, opts)
+	return tags.ParseObjectTags(oi.UserTags)
 }
 
 // TransitionObject - transition object content to target tier.
