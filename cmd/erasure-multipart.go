@@ -320,7 +320,7 @@ func (er erasureObjects) ListMultipartUploads(ctx context.Context, bucket, objec
 		populatedUploadIds.Add(uploadID)
 		uploads = append(uploads, MultipartInfo{
 			Object:    object,
-			UploadID:  base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%s.%s", globalDeploymentID, uploadID))),
+			UploadID:  base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%s.%s", globalDeploymentID(), uploadID))),
 			Initiated: fi.ModTime,
 		})
 	}
@@ -481,7 +481,7 @@ func (er erasureObjects) newMultipartUpload(ctx context.Context, bucket string, 
 		partsMetadata[index].Metadata = userDefined
 	}
 	uploadUUID := mustGetUUID()
-	uploadID := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%s.%s", globalDeploymentID, uploadUUID)))
+	uploadID := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%s.%s", globalDeploymentID(), uploadUUID)))
 	uploadIDPath := er.getUploadIDDir(bucket, object, uploadUUID)
 
 	// Write updated `xl.meta` to all disks.
@@ -1169,6 +1169,16 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 			return oi, err
 		}
 	}
+
+	// Hold namespace to complete the transaction
+	lk := er.NewNSLock(bucket, object)
+	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return oi, err
+	}
+	ctx = lkctx.Context()
+	defer lk.Unlock(lkctx)
+
 	if checksumType.IsSet() {
 		checksumType |= hash.ChecksumMultipart | hash.ChecksumIncludesMultipart
 		cs := hash.NewChecksumFromData(checksumType, checksumCombined)
@@ -1211,15 +1221,6 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 			partsMetadata[index].Versioned = opts.Versioned || opts.VersionSuspended
 		}
 	}
-
-	// Hold namespace to complete the transaction
-	lk := er.NewNSLock(bucket, object)
-	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return oi, err
-	}
-	ctx = lkctx.Context()
-	defer lk.Unlock(lkctx)
 
 	// Remove parts that weren't present in CompleteMultipartUpload request.
 	for _, curpart := range currentFI.Parts {
