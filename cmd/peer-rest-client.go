@@ -102,8 +102,10 @@ func (client *peerRESTClient) GetLocks() (lockMap map[string][]lockRequesterInfo
 }
 
 // LocalStorageInfo - fetch server information for a remote node.
-func (client *peerRESTClient) LocalStorageInfo() (info StorageInfo, err error) {
-	respBody, err := client.call(peerRESTMethodLocalStorageInfo, nil, nil, -1)
+func (client *peerRESTClient) LocalStorageInfo(metrics bool) (info StorageInfo, err error) {
+	values := make(url.Values)
+	values.Set(peerRESTMetrics, strconv.FormatBool(metrics))
+	respBody, err := client.call(peerRESTMethodLocalStorageInfo, values, nil, -1)
 	if err != nil {
 		return
 	}
@@ -919,6 +921,7 @@ func (client *peerRESTClient) SpeedTest(ctx context.Context, opts speedTestOpts)
 	values.Set(peerRESTDuration, opts.duration.String())
 	values.Set(peerRESTStorageClass, opts.storageClass)
 	values.Set(peerRESTBucket, opts.bucketName)
+	values.Set(peerRESTEnableSha256, strconv.FormatBool(opts.enableSha256))
 
 	respBody, err := client.callWithContext(context.Background(), peerRESTMethodSpeedTest, values, nil, -1)
 	if err != nil {

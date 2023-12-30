@@ -340,7 +340,7 @@ func (a adminAPIHandlers) StorageInfoHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	storageInfo := objectAPI.StorageInfo(ctx)
+	storageInfo := objectAPI.StorageInfo(ctx, true)
 
 	// Collect any disk healing.
 	healing, _ := getAggregatedBackgroundHealState(ctx, nil)
@@ -1297,6 +1297,7 @@ func (a adminAPIHandlers) ObjectSpeedTestHandler(w http.ResponseWriter, r *http.
 	customBucket := strings.TrimSpace(r.Form.Get(peerRESTBucket))
 	autotune := r.Form.Get("autotune") == "true"
 	noClear := r.Form.Get("noclear") == "true"
+	enableSha256 := r.Form.Get("enableSha256") == "true"
 
 	size, err := strconv.Atoi(sizeStr)
 	if err != nil {
@@ -1313,7 +1314,7 @@ func (a adminAPIHandlers) ObjectSpeedTestHandler(w http.ResponseWriter, r *http.
 		duration = time.Second * 10
 	}
 
-	storageInfo := objectAPI.StorageInfo(ctx)
+	storageInfo := objectAPI.StorageInfo(ctx, true)
 
 	sufficientCapacity, canAutotune, capacityErrMsg := validateObjPerfOptions(ctx, storageInfo, concurrent, size, autotune)
 	if !sufficientCapacity {
@@ -1366,6 +1367,7 @@ func (a adminAPIHandlers) ObjectSpeedTestHandler(w http.ResponseWriter, r *http.
 		autotune:         autotune,
 		storageClass:     storageClass,
 		bucketName:       customBucket,
+		enableSha256:     enableSha256,
 	})
 	var prevResult madmin.SpeedTestResult
 	for {
@@ -1911,7 +1913,7 @@ func getServerInfo(ctx context.Context, poolsInfoEnabled bool, r *http.Request) 
 		}
 	}
 
-	log, audit := fetchLoggerInfo()
+	log, audit := fetchLoggerInfo(ctx)
 
 	// Get the notification target info
 	notifyTarget := fetchLambdaInfo()
@@ -2660,19 +2662,26 @@ func fetchKMSStatusV2(ctx context.Context) []madmin.KMS {
 	return stats
 }
 
+func targetStatus(ctx context.Context, h logger.Target) madmin.Status {
+	if h.IsOnline(ctx) {
+		return madmin.Status{Status: string(madmin.ItemOnline)}
+	}
+	return madmin.Status{Status: string(madmin.ItemOffline)}
+}
+
 // fetchLoggerDetails return log info
-func fetchLoggerInfo() ([]madmin.Logger, []madmin.Audit) {
+func fetchLoggerInfo(ctx context.Context) ([]madmin.Logger, []madmin.Audit) {
 	var loggerInfo []madmin.Logger
 	var auditloggerInfo []madmin.Audit
 	for _, tgt := range logger.SystemTargets() {
 		if tgt.Endpoint() != "" {
-			loggerInfo = append(loggerInfo, madmin.Logger{tgt.String(): logger.TargetStatus(GlobalContext, tgt)})
+			loggerInfo = append(loggerInfo, madmin.Logger{tgt.String(): targetStatus(ctx, tgt)})
 		}
 	}
 
 	for _, tgt := range logger.AuditTargets() {
 		if tgt.Endpoint() != "" {
-			auditloggerInfo = append(auditloggerInfo, madmin.Audit{tgt.String(): logger.TargetStatus(GlobalContext, tgt)})
+			auditloggerInfo = append(auditloggerInfo, madmin.Audit{tgt.String(): targetStatus(ctx, tgt)})
 		}
 	}
 
@@ -2726,7 +2735,7 @@ func getClusterMetaInfo(ctx context.Context) []byte {
 		ci.Info.NoOfServers = len(globalEndpoints.Hostnames())
 		ci.Info.MinioVersion = Version
 
-		si := objectAPI.StorageInfo(ctx)
+		si := objectAPI.StorageInfo(ctx, true)
 
 		ci.Info.NoOfDrives = len(si.Disks)
 		for _, disk := range si.Disks {

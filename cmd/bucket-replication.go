@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -1468,6 +1467,24 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 				ReplicationRequest: true, // always set this to distinguish between `mc mirror` replication and serverside
 			},
 		}
+		if tagTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]; ok {
+			ondiskTimestamp, err := time.Parse(time.RFC3339, tagTmStr)
+			if err == nil {
+				dstOpts.Internal.TaggingTimestamp = ondiskTimestamp
+			}
+		}
+		if retTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp]; ok {
+			ondiskTimestamp, err := time.Parse(time.RFC3339, retTmStr)
+			if err == nil {
+				dstOpts.Internal.RetentionTimestamp = ondiskTimestamp
+			}
+		}
+		if lholdTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp]; ok {
+			ondiskTimestamp, err := time.Parse(time.RFC3339, lholdTmStr)
+			if err == nil {
+				dstOpts.Internal.LegalholdTimestamp = ondiskTimestamp
+			}
+		}
 		if _, rinfo.Err = c.CopyObject(ctx, tgt.Bucket, object, tgt.Bucket, object, getCopyObjMetadata(objInfo, tgt.StorageClass), srcOpts, dstOpts); rinfo.Err != nil {
 			rinfo.ReplicationStatus = replication.Failed
 			logger.LogIf(ctx, fmt.Errorf("unable to replicate metadata for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, rinfo.Err))
@@ -1955,10 +1972,10 @@ func (p *ReplicationPool) ResizeWorkerPriority(pri string, maxWorkers int) {
 		workers = WorkerAutoDefault
 		mrfWorkers = MRFWorkerAutoDefault
 		if len(p.workers) < WorkerAutoDefault {
-			workers = int(math.Min(float64(len(p.workers)+1), WorkerAutoDefault))
+			workers = min(len(p.workers)+1, WorkerAutoDefault)
 		}
 		if p.mrfWorkerSize < MRFWorkerAutoDefault {
-			mrfWorkers = int(math.Min(float64(p.mrfWorkerSize+1), MRFWorkerAutoDefault))
+			mrfWorkers = min(p.mrfWorkerSize+1, MRFWorkerAutoDefault)
 		}
 	}
 	if maxWorkers > 0 && workers > maxWorkers {
@@ -2051,18 +2068,18 @@ func (p *ReplicationPool) queueReplicaTask(ri ReplicateObjectInfo) {
 		case "slow":
 			logger.LogOnceIf(GlobalContext, fmt.Errorf("WARNING: Unable to keep up with incoming traffic - we recommend increasing replication priority with `mc admin config set api replication_priority=auto`"), string(replicationSubsystem))
 		default:
-			maxWorkers = int(math.Min(float64(maxWorkers), WorkerMaxLimit))
+			maxWorkers = min(maxWorkers, WorkerMaxLimit)
 			if p.ActiveWorkers() < maxWorkers {
 				p.mu.RLock()
-				workers := int(math.Min(float64(len(p.workers)+1), float64(maxWorkers)))
+				workers := min(len(p.workers)+1, maxWorkers)
 				existing := len(p.workers)
 				p.mu.RUnlock()
 				p.ResizeWorkers(workers, existing)
 			}
-			maxMRFWorkers := int(math.Min(float64(maxWorkers), MRFWorkerMaxLimit))
+			maxMRFWorkers := min(maxWorkers, MRFWorkerMaxLimit)
 			if p.ActiveMRFWorkers() < maxMRFWorkers {
 				p.mu.RLock()
-				workers := int(math.Min(float64(p.mrfWorkerSize+1), float64(maxMRFWorkers)))
+				workers := min(p.mrfWorkerSize+1, maxMRFWorkers)
 				p.mu.RUnlock()
 				p.ResizeFailedWorkers(workers)
 			}
@@ -2108,10 +2125,10 @@ func (p *ReplicationPool) queueReplicaDeleteTask(doi DeletedObjectReplicationInf
 		case "slow":
 			logger.LogOnceIf(GlobalContext, fmt.Errorf("WARNING: Unable to keep up with incoming deletes - we recommend increasing replication priority with `mc admin config set api replication_priority=auto`"), string(replicationSubsystem))
 		default:
-			maxWorkers = int(math.Min(float64(maxWorkers), WorkerMaxLimit))
+			maxWorkers = min(maxWorkers, WorkerMaxLimit)
 			if p.ActiveWorkers() < maxWorkers {
 				p.mu.RLock()
-				workers := int(math.Min(float64(len(p.workers)+1), float64(maxWorkers)))
+				workers := min(len(p.workers)+1, maxWorkers)
 				existing := len(p.workers)
 				p.mu.RUnlock()
 				p.ResizeWorkers(workers, existing)
@@ -3245,7 +3262,11 @@ func (p *ReplicationPool) persistToDrive(ctx context.Context, v MRFReplicateEntr
 		return r
 	}
 
-	for _, localDrive := range globalLocalDrives {
+	globalLocalDrivesMu.RLock()
+	localDrives := globalLocalDrives
+	globalLocalDrivesMu.RUnlock()
+
+	for _, localDrive := range localDrives {
 		r := newReader()
 		err := localDrive.CreateFile(ctx, minioMetaBucket, pathJoin(replicationMRFDir, globalLocalNodeNameHex+".bin"), -1, r)
 		r.Close()
@@ -3307,7 +3328,12 @@ func (p *ReplicationPool) loadMRF() (mrfRec MRFReplicateEntries, err error) {
 
 		return re, nil
 	}
-	for _, localDrive := range globalLocalDrives {
+
+	globalLocalDrivesMu.RLock()
+	localDrives := globalLocalDrives
+	globalLocalDrivesMu.RUnlock()
+
+	for _, localDrive := range localDrives {
 		rc, err := localDrive.ReadFileStream(p.ctx, minioMetaBucket, pathJoin(replicationMRFDir, globalLocalNodeNameHex+".bin"), 0, -1)
 		if err != nil {
 			continue

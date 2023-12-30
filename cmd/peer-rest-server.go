@@ -345,7 +345,14 @@ func (s *peerRESTServer) LocalStorageInfoHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(objLayer.LocalStorageInfo(r.Context())))
+	metrics, err := strconv.ParseBool(r.Form.Get(peerRESTMetrics))
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+
+	}
+
+	logger.LogIf(ctx, gob.NewEncoder(w).Encode(objLayer.LocalStorageInfo(r.Context(), metrics)))
 }
 
 // ServerInfoHandler - returns Server Info
@@ -1297,6 +1304,7 @@ func (s *peerRESTServer) SpeedTestHandler(w http.ResponseWriter, r *http.Request
 	concurrentStr := r.Form.Get(peerRESTConcurrent)
 	storageClass := r.Form.Get(peerRESTStorageClass)
 	bucketName := r.Form.Get(peerRESTBucket)
+	enableSha256 := r.Form.Get(peerRESTEnableSha256) == "true"
 
 	size, err := strconv.Atoi(sizeStr)
 	if err != nil {
@@ -1321,6 +1329,7 @@ func (s *peerRESTServer) SpeedTestHandler(w http.ResponseWriter, r *http.Request
 		duration:     duration,
 		storageClass: storageClass,
 		bucketName:   bucketName,
+		enableSha256: enableSha256,
 	})
 	if err != nil {
 		result.Error = err.Error()

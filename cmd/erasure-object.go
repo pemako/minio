@@ -413,6 +413,7 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 							queued:    time.Now(),
 							setIndex:  er.setIndex,
 							poolIndex: er.poolIndex,
+							scanMode:  scan,
 						})
 					})
 					// Healing is triggered and we have written
@@ -475,40 +476,50 @@ func auditDanglingObjectDeletion(ctx context.Context, bucket, object, versionID 
 	auditLogInternal(ctx, opts)
 }
 
-func joinErrors(errs ...error) error {
-	s := make([]string, 0, len(errs))
-	nonNilErrs := make([]any, 0, len(errs))
-	for _, err := range errs {
-		if err == nil {
-			continue
+func joinErrs(errs []error) []string {
+	s := make([]string, len(errs))
+	for i := range s {
+		if errs[i] == nil {
+			s[i] = "<nil>"
+		} else {
+			s[i] = errs[i].Error()
 		}
-		s = append(s, "[%w]")
-		nonNilErrs = append(nonNilErrs, err)
 	}
-	// If all the errors were nil, return nil.
-	if len(nonNilErrs) == 0 {
-		return nil
-	}
-	allErrs := strings.Join(s, "\n")
-	return fmt.Errorf(allErrs, nonNilErrs...)
+	return s
 }
 
 func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object string, metaArr []FileInfo, errs []error, dataErrs []error, opts ObjectOptions) (FileInfo, error) {
-	_, file, line, cok := runtime.Caller(1)
 	var err error
 	m, ok := isObjectDangling(metaArr, errs, dataErrs)
 	if ok {
 		tags := make(map[string]interface{}, 4)
 		tags["set"] = er.setIndex
 		tags["pool"] = er.poolIndex
-		tags["merrs"] = joinErrors(errs...)     // errors.Join(errs...)
-		tags["derrs"] = joinErrors(dataErrs...) // errors.Join(dataErrs...)
+		tags["merrs"] = joinErrs(errs)
+		tags["derrs"] = joinErrs(dataErrs)
 		if m.IsValid() {
 			tags["size"] = m.Size
 			tags["mtime"] = m.ModTime.Format(http.TimeFormat)
+			tags["data"] = m.Erasure.DataBlocks
 			tags["parity"] = m.Erasure.ParityBlocks
+		} else {
+			tags["invalid-meta"] = true
+			tags["data"] = er.setDriveCount - er.defaultParityCount
+			tags["parity"] = er.defaultParityCount
 		}
 
+		// count the number of offline disks
+		offline := 0
+		for i := 0; i < max(len(errs), len(dataErrs)); i++ {
+			if i < len(errs) && errs[i] == errDiskNotFound || i < len(dataErrs) && dataErrs[i] == errDiskNotFound {
+				offline++
+			}
+		}
+		if offline > 0 {
+			tags["offline"] = offline
+		}
+
+		_, file, line, cok := runtime.Caller(1)
 		if cok {
 			tags["caller"] = fmt.Sprintf("%s:%d", file, line)
 		}
@@ -535,7 +546,7 @@ func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object st
 				if disks[index] == nil {
 					return errDiskNotFound
 				}
-				return disks[index].DeleteVersion(ctx, bucket, object, fi, false)
+				return disks[index].DeleteVersion(ctx, bucket, object, fi, false, DeleteOptions{})
 			}, index)
 		}
 
@@ -1021,7 +1032,7 @@ func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry str
 			if !fi.IsValid() {
 				return errFileCorrupt
 			}
-			sign, err := disks[index].RenameData(ctx, srcBucket, srcEntry, fi, dstBucket, dstEntry)
+			sign, err := disks[index].RenameData(ctx, srcBucket, srcEntry, fi, dstBucket, dstEntry, RenameOptions{})
 			if err != nil {
 				return err
 			}
@@ -1048,7 +1059,7 @@ func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry str
 			// caller this dangling object will be now scheduled to be removed
 			// via active healing.
 			dg.Go(func() error {
-				return disks[index].DeleteVersion(context.Background(), dstBucket, dstEntry, metadata[index], false)
+				return disks[index].DeleteVersion(context.Background(), dstBucket, dstEntry, metadata[index], false, DeleteOptions{UndoWrite: true})
 			}, index)
 		}
 		dg.Wait()
@@ -1126,8 +1137,8 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 	case size == 0:
 		buffer = make([]byte, 1) // Allocate atleast a byte to reach EOF
 	case size >= fi.Erasure.BlockSize:
-		buffer = er.bp.Get()
-		defer er.bp.Put(buffer)
+		buffer = globalBytePoolCap.Get()
+		defer globalBytePoolCap.Put(buffer)
 	case size < fi.Erasure.BlockSize:
 		// No need to allocate fully blockSizeV1 buffer if the incoming data is smaller.
 		buffer = make([]byte, size, 2*size+int64(fi.Erasure.ParityBlocks+fi.Erasure.DataBlocks-1))
@@ -1217,7 +1228,7 @@ func (er erasureObjects) PutObject(ctx context.Context, bucket string, object st
 }
 
 // Heal up to two versions of one object when there is disparity between disks
-func healObjectVersionsDisparity(bucket string, entry metaCacheEntry) error {
+func healObjectVersionsDisparity(bucket string, entry metaCacheEntry, scanMode madmin.HealScanMode) error {
 	if entry.isDir() {
 		return nil
 	}
@@ -1241,13 +1252,13 @@ func healObjectVersionsDisparity(bucket string, entry metaCacheEntry) error {
 
 	fivs, err := entry.fileInfoVersions(bucket)
 	if err != nil {
-		go healObject(bucket, entry.name, "", madmin.HealDeepScan)
+		healObject(bucket, entry.name, "", madmin.HealDeepScan)
 		return err
 	}
 
 	if len(fivs.Versions) <= 2 {
 		for _, version := range fivs.Versions {
-			go healObject(bucket, entry.name, version.VersionID, madmin.HealNormalScan)
+			healObject(bucket, entry.name, version.VersionID, scanMode)
 		}
 	}
 
@@ -1377,8 +1388,8 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	case size == 0:
 		buffer = make([]byte, 1) // Allocate atleast a byte to reach EOF
 	case size >= fi.Erasure.BlockSize || size == -1:
-		buffer = er.bp.Get()
-		defer er.bp.Put(buffer)
+		buffer = globalBytePoolCap.Get()
+		defer globalBytePoolCap.Put(buffer)
 	case size < fi.Erasure.BlockSize:
 		// No need to allocate fully blockSizeV1 buffer if the incoming data is smaller.
 		buffer = make([]byte, size, 2*size+int64(fi.Erasure.ParityBlocks+fi.Erasure.DataBlocks-1))
@@ -1437,10 +1448,10 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	toEncode := io.Reader(data)
 	if data.Size() > bigFileThreshold {
 		// We use 2 buffers, so we always have a full buffer of input.
-		bufA := er.bp.Get()
-		bufB := er.bp.Get()
-		defer er.bp.Put(bufA)
-		defer er.bp.Put(bufB)
+		bufA := globalBytePoolCap.Get()
+		bufB := globalBytePoolCap.Get()
+		defer globalBytePoolCap.Put(bufA)
+		defer globalBytePoolCap.Put(bufB)
 		ra, err := readahead.NewReaderBuffer(data, [][]byte{bufA[:fi.Erasure.BlockSize], bufB[:fi.Erasure.BlockSize]})
 		if err == nil {
 			toEncode = ra
@@ -1599,7 +1610,7 @@ func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object
 			if disks[index] == nil {
 				return errDiskNotFound
 			}
-			return disks[index].DeleteVersion(ctx, bucket, object, fi, forceDelMarker)
+			return disks[index].DeleteVersion(ctx, bucket, object, fi, forceDelMarker, DeleteOptions{})
 		}, index)
 	}
 	// return errors if any during deletion
@@ -1712,7 +1723,7 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 				}
 				return
 			}
-			errs := disk.DeleteVersions(ctx, bucket, dedupVersions)
+			errs := disk.DeleteVersions(ctx, bucket, dedupVersions, DeleteOptions{})
 			for i, err := range errs {
 				if err == nil {
 					continue

@@ -90,9 +90,11 @@ func init() {
 		getNetworkMetrics(),
 		getMinioVersionMetrics(),
 		getS3TTFBMetric(),
+		getTierMetrics(),
 		getNotificationMetrics(),
 		getDistLockMetrics(),
 		getIAMNodeMetrics(),
+		getLocalStorageMetrics(),
 	}
 
 	bucketMetricsGroups := []*MetricsGroup{
@@ -155,6 +157,7 @@ const (
 	usageSubsystem            MetricSubsystem = "usage"
 	quotaSubsystem            MetricSubsystem = "quota"
 	ilmSubsystem              MetricSubsystem = "ilm"
+	tierSubsystem             MetricSubsystem = "tier"
 	scannerSubsystem          MetricSubsystem = "scanner"
 	iamSubsystem              MetricSubsystem = "iam"
 	kmsSubsystem              MetricSubsystem = "kms"
@@ -246,6 +249,7 @@ const (
 	sizeDistribution    = "size_distribution"
 	versionDistribution = "version_distribution"
 	ttfbDistribution    = "seconds_distribution"
+	ttlbDistribution    = "ttlb_seconds_distribution"
 
 	lastActivityTime = "last_activity_nano_seconds"
 	startTime        = "starttime_seconds"
@@ -261,6 +265,9 @@ const (
 	transitionedBytes    MetricName = "transitioned_bytes"
 	transitionedObjects  MetricName = "transitioned_objects"
 	transitionedVersions MetricName = "transitioned_versions"
+
+	tierRequestsSuccess MetricName = "requests_success"
+	tierRequestsFailure MetricName = "requests_failure"
 
 	kmsOnline          = "online"
 	kmsRequestsSuccess = "request_success"
@@ -1598,47 +1605,52 @@ func getGoMetrics() *MetricsGroup {
 	return mg
 }
 
+// getHistogramMetrics fetches histogram metrics and returns it in a []Metric
+// Note: Typically used in MetricGroup.RegisterRead
+func getHistogramMetrics(hist *prometheus.HistogramVec, desc MetricDescription) []Metric {
+	ch := make(chan prometheus.Metric)
+	go func() {
+		defer close(ch)
+		// Collects prometheus metrics from hist and sends it over ch
+		hist.Collect(ch)
+	}()
+
+	// Converts metrics received into internal []Metric type
+	var metrics []Metric
+	for promMetric := range ch {
+		dtoMetric := &dto.Metric{}
+		err := promMetric.Write(dtoMetric)
+		if err != nil {
+			// Log error and continue to receive other metric
+			// values
+			logger.LogIf(GlobalContext, err)
+			continue
+		}
+
+		h := dtoMetric.GetHistogram()
+		for _, b := range h.Bucket {
+			labels := make(map[string]string)
+			for _, lp := range dtoMetric.GetLabel() {
+				labels[*lp.Name] = *lp.Value
+			}
+			labels["le"] = fmt.Sprintf("%.3f", *b.UpperBound)
+			metric := Metric{
+				Description:    desc,
+				VariableLabels: labels,
+				Value:          float64(b.GetCumulativeCount()),
+			}
+			metrics = append(metrics, metric)
+		}
+	}
+	return metrics
+}
+
 func getBucketTTFBMetric() *MetricsGroup {
 	mg := &MetricsGroup{
 		cacheInterval: 10 * time.Second,
 	}
-	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
-		// Read prometheus metric on this channel
-		ch := make(chan prometheus.Metric)
-		var wg sync.WaitGroup
-		wg.Add(1)
-
-		// Read prometheus histogram data and convert it to internal metric data
-		go func() {
-			defer wg.Done()
-			for promMetric := range ch {
-				dtoMetric := &dto.Metric{}
-				err := promMetric.Write(dtoMetric)
-				if err != nil {
-					logger.LogIf(GlobalContext, err)
-					return
-				}
-				h := dtoMetric.GetHistogram()
-				for _, b := range h.Bucket {
-					labels := make(map[string]string)
-					for _, lp := range dtoMetric.GetLabel() {
-						labels[*lp.Name] = *lp.Value
-					}
-					labels["le"] = fmt.Sprintf("%.3f", *b.UpperBound)
-					metric := Metric{
-						Description:    getBucketTTFBDistributionMD(),
-						VariableLabels: labels,
-						Value:          float64(b.GetCumulativeCount()),
-					}
-					metrics = append(metrics, metric)
-				}
-			}
-		}()
-
-		bucketHTTPRequestsDuration.Collect(ch)
-		close(ch)
-		wg.Wait()
-		return
+	mg.RegisterRead(func(ctx context.Context) []Metric {
+		return getHistogramMetrics(bucketHTTPRequestsDuration, getBucketTTFBDistributionMD())
 	})
 	return mg
 }
@@ -1647,43 +1659,18 @@ func getS3TTFBMetric() *MetricsGroup {
 	mg := &MetricsGroup{
 		cacheInterval: 10 * time.Second,
 	}
-	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
-		// Read prometheus metric on this channel
-		ch := make(chan prometheus.Metric)
-		var wg sync.WaitGroup
-		wg.Add(1)
+	mg.RegisterRead(func(ctx context.Context) []Metric {
+		return getHistogramMetrics(httpRequestsDuration, getS3TTFBDistributionMD())
+	})
+	return mg
+}
 
-		// Read prometheus histogram data and convert it to internal metric data
-		go func() {
-			defer wg.Done()
-			for promMetric := range ch {
-				dtoMetric := &dto.Metric{}
-				err := promMetric.Write(dtoMetric)
-				if err != nil {
-					logger.LogIf(GlobalContext, err)
-					return
-				}
-				h := dtoMetric.GetHistogram()
-				for _, b := range h.Bucket {
-					labels := make(map[string]string)
-					for _, lp := range dtoMetric.GetLabel() {
-						labels[*lp.Name] = *lp.Value
-					}
-					labels["le"] = fmt.Sprintf("%.3f", *b.UpperBound)
-					metric := Metric{
-						Description:    getS3TTFBDistributionMD(),
-						VariableLabels: labels,
-						Value:          float64(b.GetCumulativeCount()),
-					}
-					metrics = append(metrics, metric)
-				}
-			}
-		}()
-
-		httpRequestsDuration.Collect(ch)
-		close(ch)
-		wg.Wait()
-		return
+func getTierMetrics() *MetricsGroup {
+	mg := &MetricsGroup{
+		cacheInterval: 10 * time.Second,
+	}
+	mg.RegisterRead(func(ctx context.Context) []Metric {
+		return globalTierMetrics.Report()
 	})
 	return mg
 }
@@ -2460,7 +2447,7 @@ func getNotificationMetrics() *MetricsGroup {
 					Namespace: minioNamespace,
 					Subsystem: notifySubsystem,
 					Name:      "current_send_in_progress",
-					Help:      "Number of concurrent async Send calls active to all targets",
+					Help:      "Number of concurrent async Send calls active to all targets (deprecated, please use 'minio_notify_target_current_send_in_progress' instead)",
 					Type:      gaugeMetric,
 				},
 				Value: float64(nstats.CurrentSendCalls),
@@ -2470,7 +2457,7 @@ func getNotificationMetrics() *MetricsGroup {
 					Namespace: minioNamespace,
 					Subsystem: notifySubsystem,
 					Name:      "events_skipped_total",
-					Help:      "Events that were skipped due to full queue",
+					Help:      "Events that were skipped to be sent to the targets due to the in-memory queue being full",
 					Type:      counterMetric,
 				},
 				Value: float64(nstats.EventsSkipped),
@@ -2480,7 +2467,7 @@ func getNotificationMetrics() *MetricsGroup {
 					Namespace: minioNamespace,
 					Subsystem: notifySubsystem,
 					Name:      "events_errors_total",
-					Help:      "Events that were failed while sending to target",
+					Help:      "Events that were failed to be sent to the targets (deprecated, please use 'minio_notify_target_failed_events' instead)",
 					Type:      counterMetric,
 				},
 				Value: float64(nstats.EventsErrorsTotal),
@@ -2490,21 +2477,54 @@ func getNotificationMetrics() *MetricsGroup {
 					Namespace: minioNamespace,
 					Subsystem: notifySubsystem,
 					Name:      "events_sent_total",
-					Help:      "Total number of events sent since start",
+					Help:      "Total number of events sent to the targets (deprecated, please use 'minio_notify_target_total_events' instead)",
 					Type:      counterMetric,
 				},
 				Value: float64(nstats.TotalEvents),
 			})
-			for _, st := range nstats.TargetStats {
+			for id, st := range nstats.TargetStats {
+				metrics = append(metrics, Metric{
+					Description: MetricDescription{
+						Namespace: minioNamespace,
+						Subsystem: notifySubsystem,
+						Name:      "target_total_events",
+						Help:      "Total number of events sent (or) queued to the target",
+						Type:      counterMetric,
+					},
+					VariableLabels: map[string]string{"target_id": id.ID, "target_name": id.Name},
+					Value:          float64(st.TotalEvents),
+				})
+				metrics = append(metrics, Metric{
+					Description: MetricDescription{
+						Namespace: minioNamespace,
+						Subsystem: notifySubsystem,
+						Name:      "target_failed_events",
+						Help:      "Number of events failed to be sent (or) queued to the target",
+						Type:      counterMetric,
+					},
+					VariableLabels: map[string]string{"target_id": id.ID, "target_name": id.Name},
+					Value:          float64(st.FailedEvents),
+				})
+				metrics = append(metrics, Metric{
+					Description: MetricDescription{
+						Namespace: minioNamespace,
+						Subsystem: notifySubsystem,
+						Name:      "target_current_send_in_progress",
+						Help:      "Number of concurrent async Send calls active to the target",
+						Type:      gaugeMetric,
+					},
+					VariableLabels: map[string]string{"target_id": id.ID, "target_name": id.Name},
+					Value:          float64(st.CurrentSendCalls),
+				})
 				metrics = append(metrics, Metric{
 					Description: MetricDescription{
 						Namespace: minioNamespace,
 						Subsystem: notifySubsystem,
 						Name:      "target_queue_length",
-						Help:      "Number of unsent notifications in queue for target",
+						Help:      "Number of events currently staged in the queue_dir configured for the target",
 						Type:      gaugeMetric,
 					},
-					VariableLabels: map[string]string{"target_id": st.ID.ID, "target_name": st.ID.Name},
+					VariableLabels: map[string]string{"target_id": id.ID, "target_name": id.Name},
 					Value:          float64(st.CurrentQueue),
 				})
 			}
@@ -3114,7 +3134,7 @@ func getLocalStorageMetrics() *MetricsGroup {
 		}
 
 		metrics = make([]Metric, 0, 50)
-		storageInfo := objLayer.LocalStorageInfo(ctx)
+		storageInfo := objLayer.LocalStorageInfo(ctx, true)
 		onlineDrives, offlineDrives := getOnlineOfflineDisksStats(storageInfo.Disks)
 		totalDrives := onlineDrives.Merge(offlineDrives)
 
@@ -3216,12 +3236,32 @@ func getClusterHealthStatusMD() MetricDescription {
 	}
 }
 
-func getClusterErasureSetToleranceMD() MetricDescription {
+func getClusterErasureSetWriteQuorumMD() MetricDescription {
 	return MetricDescription{
 		Namespace: clusterMetricNamespace,
 		Subsystem: "health",
-		Name:      "erasure_set_tolerance",
-		Help:      "Get erasure set tolerance status",
+		Name:      "erasure_set_write_quorum",
+		Help:      "Get the write quorum for this erasure set",
+		Type:      gaugeMetric,
+	}
+}
+
+func getClusterErasureSetOnlineDrivesMD() MetricDescription {
+	return MetricDescription{
+		Namespace: clusterMetricNamespace,
+		Subsystem: "health",
+		Name:      "erasure_set_online_drives",
+		Help:      "Get the count of the online drives in this erasure set",
+		Type:      gaugeMetric,
+	}
+}
+
+func getClusterErasureSetHealingDrivesMD() MetricDescription {
+	return MetricDescription{
+		Namespace: clusterMetricNamespace,
+		Subsystem: "health",
+		Name:      "erasure_set_healing_drives",
+		Help:      "Get the count of healing drives of this erasure set",
 		Type:      gaugeMetric,
 	}
 }
@@ -3237,10 +3277,10 @@ func getClusterHealthMetrics() *MetricsGroup {
 			return
 		}
 
-		metrics = make([]Metric, 0, 2)
-
 		opts := HealthOptions{}
 		result := objLayer.Health(ctx, opts)
+
+		metrics = make([]Metric, 0, 2+3*len(result.ESHealth))
 
 		metrics = append(metrics, Metric{
 			Description: getClusterWriteQuorumMD(),
@@ -3263,9 +3303,19 @@ func getClusterHealthMetrics() *MetricsGroup {
 				"set":  strconv.Itoa(h.SetID),
 			}
 			metrics = append(metrics, Metric{
-				Description:    getClusterErasureSetToleranceMD(),
+				Description:    getClusterErasureSetWriteQuorumMD(),
 				VariableLabels: labels,
-				Value:          float64(h.HealthyDrives - h.WriteQuorum),
+				Value:          float64(h.WriteQuorum),
+			})
+			metrics = append(metrics, Metric{
+				Description:    getClusterErasureSetOnlineDrivesMD(),
+				VariableLabels: labels,
+				Value:          float64(h.HealthyDrives),
+			})
+			metrics = append(metrics, Metric{
+				Description:    getClusterErasureSetHealingDrivesMD(),
+				VariableLabels: labels,
+				Value:          float64(h.HealingDrives),
 			})
 		}
 
@@ -3359,7 +3409,7 @@ func getClusterStorageMetrics() *MetricsGroup {
 
 		// Fetch disk space info, ignore errors
 		metrics = make([]Metric, 0, 10)
-		storageInfo := objLayer.StorageInfo(ctx)
+		storageInfo := objLayer.StorageInfo(ctx, true)
 		onlineDrives, offlineDrives := getOnlineOfflineDisksStats(storageInfo.Disks)
 		totalDrives := onlineDrives.Merge(offlineDrives)
 

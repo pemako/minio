@@ -131,11 +131,15 @@ For deployments with [bucket](https://min.io/docs/minio/linux/administration/buc
 
 ## Bucket Notification Metrics
 
-| Name                                    | Description                                                  |
-|:----------------------------------------|:-------------------------------------------------------------|
-| `minio_notify_current_send_in_progress` | Number of concurrent async Send calls active to all targets. |
-| `minio_notify_target_queue_length`      | Number of unsent notifications in queue for target.          |
-|                                         |                                                              |
+| Name                                           | Description                                                                                                                                 |
+|:-----------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------|
+| `minio_notify_current_send_in_progress`        | Number of concurrent async Send calls active to all targets (deprecated, please use 'minio_notify_target_current_send_in_progress' instead) |
+| `minio_notify_events_errors_total`             | Events that were failed to be sent to the targets (deprecated, please use 'minio_notify_target_failed_events' instead)                      |
+| `minio_notify_events_sent_total`               | Total number of events sent to the targets (deprecated, please use 'minio_notify_target_total_events' instead)                              |
+| `minio_notify_events_skipped_total`            | Events that were skipped to be sent to the targets due to the in-memory queue being full                                                    |
+| `minio_notify_target_current_send_in_progress` | Number of concurrent async Send calls active to the target                                                                                  |
+| `minio_notify_target_queue_length`             | Number of events currently staged in the queue_dir configured for the target.                                                               |
+| `minio_notify_target_total_events`             | Total number of events sent (or) queued to the target                                                                                       |
 
 ## S3 API Request Metrics
 
@@ -196,6 +200,14 @@ For deployments with [bucket](https://min.io/docs/minio/linux/administration/buc
 | `minio_node_ilm_transition_missed_immediate_tasks` | Number of missed immediate ILM transition tasks.                            |
 | `minio_node_ilm_versions_scanned`                  | Total number of object versions checked for ilm actions since server start. |
 
+## Tier Metrics
+
+| Name                                               | Description                                                                 |
+|:---------------------------------------------------|:----------------------------------------------------------------------------|
+| `minio_node_tier_tier_ttlb_seconds_distribution`   | Distribution of time to last byte for objects downloaded from warm tier     |
+| `minio_node_tier_requests_success`                 | Number of requests to download object from warm tier that were successful   | 
+| `minio_node_tier_requests_failure`                 | Number of requests to download object from warm tier that were failure      | 
+
 ## System Metrics
 
 | Name                                       | Description                                                                                                     |
@@ -234,7 +246,7 @@ Metrics may include one or more additional labels, such as the server that calcu
 These metrics can be obtained from any MinIO server once per collection by using the following URL:
 
 ```shell
-https://HOSTNAME:PORT/minio/metrics/v2/bucket
+https://HOSTNAME:PORT/minio/v2/metrics/bucket
 ```
 
 Replace ``HOSTNAME:PORT`` with the hostname of your MinIO deployment.
