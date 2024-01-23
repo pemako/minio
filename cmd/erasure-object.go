@@ -550,7 +550,22 @@ func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object st
 			}, index)
 		}
 
-		g.Wait()
+		rmDisks := make(map[string]string, len(disks))
+		for index, err := range g.Wait() {
+			var errStr, diskName string
+			if err != nil {
+				errStr = err.Error()
+			} else {
+				errStr = "<nil>"
+			}
+			if disks[index] != nil {
+				diskName = disks[index].String()
+			} else {
+				diskName = fmt.Sprintf("disk-%d", index)
+			}
+			rmDisks[diskName] = errStr
+		}
+		tags["cleanupResult"] = rmDisks
 	}
 	return m, err
 }
@@ -940,7 +955,7 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	for i := range onlineMeta {
 		// verify metadata is valid, it has similar erasure info
 		// as well as common modtime, if modtime is not possible
-		// verify if it has common "etag" atleast.
+		// verify if it has common "etag" at least.
 		if onlineMeta[i].IsValid() && onlineMeta[i].Erasure.Equal(fi.Erasure) {
 			ok := onlineMeta[i].ModTime.Equal(modTime)
 			if modTime.IsZero() || modTime.Equal(timeSentinel) {
@@ -1135,7 +1150,7 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 	var buffer []byte
 	switch size := data.Size(); {
 	case size == 0:
-		buffer = make([]byte, 1) // Allocate atleast a byte to reach EOF
+		buffer = make([]byte, 1) // Allocate at least a byte to reach EOF
 	case size >= fi.Erasure.BlockSize:
 		buffer = globalBytePoolCap.Get()
 		defer globalBytePoolCap.Put(buffer)
@@ -1386,7 +1401,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	var buffer []byte
 	switch size := data.Size(); {
 	case size == 0:
-		buffer = make([]byte, 1) // Allocate atleast a byte to reach EOF
+		buffer = make([]byte, 1) // Allocate at least a byte to reach EOF
 	case size >= fi.Erasure.BlockSize || size == -1:
 		buffer = globalBytePoolCap.Get()
 		defer globalBytePoolCap.Put(buffer)
@@ -1544,7 +1559,6 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		if errors.Is(err, errFileNotFound) {
 			return ObjectInfo{}, toObjectErr(errErasureWriteQuorum, bucket, object)
 		}
-		logger.LogOnceIf(ctx, err, "erasure-object-rename-"+bucket+"-"+object)
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 

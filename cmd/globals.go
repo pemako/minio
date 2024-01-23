@@ -33,6 +33,7 @@ import (
 	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/browser"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
 	"go.uber.org/atomic"
@@ -191,6 +192,9 @@ var (
 	// Disable redirect, default is enabled.
 	globalBrowserRedirect bool
 
+	// globalBrowserConfig Browser user configurable settings
+	globalBrowserConfig browser.Config
+
 	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
 	globalInplaceUpdateDisabled = false
 
@@ -289,7 +293,7 @@ var (
 	// Global server's network statistics
 	globalConnStats = newConnStats()
 
-	// Global HTTP request statisitics
+	// Global HTTP request statistics
 	globalHTTPStats = newHTTPStats()
 
 	// Global bucket network and API statistics

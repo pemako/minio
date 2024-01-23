@@ -91,7 +91,7 @@ func diskErrToDriveState(err error) (state string) {
 	switch {
 	case errors.Is(err, errDiskNotFound) || errors.Is(err, context.DeadlineExceeded):
 		state = madmin.DriveStateOffline
-	case errors.Is(err, errCorruptedFormat):
+	case errors.Is(err, errCorruptedFormat) || errors.Is(err, errCorruptedBackend):
 		state = madmin.DriveStateCorrupt
 	case errors.Is(err, errUnformattedDisk):
 		state = madmin.DriveStateUnformatted
@@ -203,6 +203,8 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint, metrics bool) (disks
 				APICalls:                make(map[string]uint64, len(info.Metrics.APICalls)),
 				TotalErrorsAvailability: info.Metrics.TotalErrorsAvailability,
 				TotalErrorsTimeout:      info.Metrics.TotalErrorsTimeout,
+				TotalTokens:             info.Metrics.TotalTokens,
+				TotalWaiting:            info.Metrics.TotalWaiting,
 			}
 			for k, v := range info.Metrics.LastMinute {
 				if v.N > 0 {
@@ -522,7 +524,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				// Calc usage
 				before := cache.Info.LastUpdate
 				var err error
-				cache, err = disk.NSScanner(ctx, cache, updates, healScanMode)
+				cache, err = disk.NSScanner(ctx, cache, updates, healScanMode, nil)
 				if err != nil {
 					if !cache.Info.LastUpdate.IsZero() && cache.Info.LastUpdate.After(before) {
 						logger.LogIf(ctx, cache.save(ctx, er, cacheName))

@@ -170,16 +170,20 @@ For deployments with [bucket](https://min.io/docs/minio/linux/administration/buc
 
 ## Drive Metrics
 
-| Name                             | Description                                                         |
-|:---------------------------------|:--------------------------------------------------------------------|
-| `minio_node_drive_free_bytes`    | Total storage available on a drive.                                 |
-| `minio_node_drive_free_inodes`   | Total free inodes.                                                  |
-| `minio_node_drive_latency_us`    | Average last minute latency in µs for drive API storage operations. |
-| `minio_node_drive_offline_total` | Total drives offline in this node.                                  |
-| `minio_node_drive_online_total`  | Total drives online in this node.                                   |
-| `minio_node_drive_total`         | Total drives in this node.                                          |
-| `minio_node_drive_total_bytes`   | Total storage on a drive.                                           |
-| `minio_node_drive_used_bytes`    | Total storage used on a drive.                                      |
+| Name                                   | Description                                                                         |
+|:---------------------------------------|:------------------------------------------------------------------------------------|
+| `minio_node_drive_free_bytes`          | Total storage available on a drive.                                                 |
+| `minio_node_drive_free_inodes`         | Total free inodes.                                                                  |
+| `minio_node_drive_latency_us`          | Average last minute latency in µs for drive API storage operations.                 |
+| `minio_node_drive_offline_total`       | Total drives offline in this node.                                                  |
+| `minio_node_drive_online_total`        | Total drives online in this node.                                                   |
+| `minio_node_drive_total`               | Total drives in this node.                                                          |
+| `minio_node_drive_total_bytes`         | Total storage on a drive.                                                           |
+| `minio_node_drive_used_bytes`          | Total storage used on a drive.                                                      |
+| `minio_node_drive_errors_timeout`      | Total number of drive timeout errors since server start                             |
+| `minio_node_drive_errors_availability` | Total number of drive I/O errors, permission denied and timeouts since server start |
+| `minio_node_drive_io_waiting`          | Total number I/O operations waiting on drive                                        |
+| `minio_node_drive_io_tokens`           | Total number concurrent I/O operations configured on drive                          |
 
 ## Identity and Access Management (IAM) Metrics
 
@@ -192,13 +196,20 @@ For deployments with [bucket](https://min.io/docs/minio/linux/administration/buc
 
 ## Information Lifecycle Management (ILM) Metrics
 
-| Name                                               | Description                                                                 |
-|:---------------------------------------------------|:----------------------------------------------------------------------------|
-| `minio_node_ilm_expiry_pending_tasks`              | Number of pending ILM expiry tasks in the queue.                            |
-| `minio_node_ilm_transition_active_tasks`           | Number of active ILM transition tasks.                                      |
-| `minio_node_ilm_transition_pending_tasks`          | Number of pending ILM transition tasks in the queue.                        |
-| `minio_node_ilm_transition_missed_immediate_tasks` | Number of missed immediate ILM transition tasks.                            |
-| `minio_node_ilm_versions_scanned`                  | Total number of object versions checked for ilm actions since server start. |
+| Name                                                         | Description                                                                                                |
+|:-------------------------------------------------------------|:-----------------------------------------------------------------------------------------------------------|
+| `minio_node_ilm_expiry_pending_tasks`                        | Number of pending ILM expiry tasks in the queue.                                                           |
+| `minio_node_ilm_transition_active_tasks`                     | Number of active ILM transition tasks.                                                                     |
+| `minio_node_ilm_transition_pending_tasks`                    | Number of pending ILM transition tasks in the queue.                                                       |
+| `minio_node_ilm_transition_missed_immediate_tasks`           | Number of missed immediate ILM transition tasks.                                                           |
+| `minio_node_ilm_versions_scanned`                            | Total number of object versions checked for ilm actions since server start.                                |
+| `minio_node_ilm_action_count_delete_action`                  | Total action outcome of lifecycle checks since server start for deleting object                            |
+| `minio_node_ilm_action_count_delete_version_action`          | Total action outcome of lifecycle checks since server start for deleting a version                         |
+| `minio_node_ilm_action_count_transition_action`              | Total action outcome of lifecycle checks since server start for transition of an object                    |
+| `minio_node_ilm_action_count_transition_version_action`      | Total action outcome of lifecycle checks since server start for transition of a particular object version  |
+| `minio_node_ilm_action_count_delete_restored_action`         | Total action outcome of lifecycle checks since server start for deletion of temporarily restored object    |
+| `minio_node_ilm_action_count_delete_restored_version_action` | Total action outcome of lifecycle checks since server start for deletion of a temporarily restored version |
+| `minio_node_ilm_action_count_delete_all_versions_action`     | Total action outcome of lifecycle checks since server start for deletion of all versions                   |
 
 ## Tier Metrics
 
@@ -221,6 +232,7 @@ For deployments with [bucket](https://min.io/docs/minio/linux/administration/buc
 | `minio_node_io_write_bytes`                | Total bytes written by the process to the underlying storage system, /proc/[pid]/io write_bytes.                |
 | `minio_node_process_cpu_total_seconds`     | Total user and system CPU time spent in seconds.                                                                |
 | `minio_node_process_resident_memory_bytes` | Resident memory size in bytes.                                                                                  |
+| `minio_node_process_virtual_memory_bytes`  | Virtual memory size in bytes.                                                                                   |
 | `minio_node_process_starttime_seconds`     | Start time for MinIO process per node, time in seconds since Unix epoc.                                         |
 | `minio_node_process_uptime_seconds`        | Uptime for MinIO process per node in seconds.                                                                   |
 

@@ -1931,31 +1931,12 @@ func (z *erasureServerPools) HealFormat(ctx context.Context, dryRun bool) (madmi
 }
 
 func (z *erasureServerPools) HealBucket(ctx context.Context, bucket string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
-	r := madmin.HealResultItem{
-		Type:   madmin.HealItemBucket,
-		Bucket: bucket,
-	}
-
 	// Attempt heal on the bucket metadata, ignore any failures
 	hopts := opts
 	hopts.Recreate = false
 	defer z.HealObject(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, bucket, bucketMetadataFile), "", hopts)
 
-	for _, pool := range z.serverPools {
-		result, err := pool.HealBucket(ctx, bucket, opts)
-		if err != nil {
-			if _, ok := err.(BucketNotFound); ok {
-				continue
-			}
-			return result, err
-		}
-		r.DiskCount += result.DiskCount
-		r.SetCount += result.SetCount
-		r.Before.Drives = append(r.Before.Drives, result.Before.Drives...)
-		r.After.Drives = append(r.After.Drives, result.After.Drives...)
-	}
-
-	return r, nil
+	return z.s3Peer.HealBucket(ctx, bucket, opts)
 }
 
 // Walk a bucket, optionally prefix recursively, until we have returned
@@ -2279,7 +2260,7 @@ const (
 	vmware = "VMWare"
 )
 
-// HealthOptions takes input options to return sepcific information
+// HealthOptions takes input options to return specific information
 type HealthOptions struct {
 	Maintenance    bool
 	DeploymentType string
@@ -2296,6 +2277,7 @@ type HealthResult struct {
 		PoolID, SetID int
 		HealthyDrives int
 		HealingDrives int
+		ReadQuorum    int
 		WriteQuorum   int
 	}
 	WriteQuorum   int
@@ -2373,8 +2355,10 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 	}
 
 	b := z.BackendInfo()
+	poolReadQuorums := make([]int, len(b.StandardSCData))
 	poolWriteQuorums := make([]int, len(b.StandardSCData))
 	for i, data := range b.StandardSCData {
+		poolReadQuorums[i] = data
 		poolWriteQuorums[i] = data
 		if data == b.StandardSCParity {
 			poolWriteQuorums[i] = data + 1
@@ -2412,15 +2396,17 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 	for poolIdx := range erasureSetUpCount {
 		for setIdx := range erasureSetUpCount[poolIdx] {
 			result.ESHealth = append(result.ESHealth, struct {
-				Maintenance                               bool
-				PoolID, SetID                             int
-				HealthyDrives, HealingDrives, WriteQuorum int
+				Maintenance                  bool
+				PoolID, SetID                int
+				HealthyDrives, HealingDrives int
+				ReadQuorum, WriteQuorum      int
 			}{
 				Maintenance:   opts.Maintenance,
 				SetID:         setIdx,
 				PoolID:        poolIdx,
 				HealthyDrives: erasureSetUpCount[poolIdx][setIdx].online,
 				HealingDrives: erasureSetUpCount[poolIdx][setIdx].healing,
+				ReadQuorum:    poolReadQuorums[poolIdx],
 				WriteQuorum:   poolWriteQuorums[poolIdx],
 			})
 
@@ -2449,7 +2435,7 @@ func (z *erasureServerPools) PutObjectMetadata(ctx context.Context, bucket, obje
 	}
 
 	opts.MetadataChg = true
-	// We don't know the size here set 1GiB atleast.
+	// We don't know the size here set 1GiB at least.
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -2467,7 +2453,7 @@ func (z *erasureServerPools) PutObjectTags(ctx context.Context, bucket, object s
 
 	opts.MetadataChg = true
 
-	// We don't know the size here set 1GiB atleast.
+	// We don't know the size here set 1GiB at least.
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
 	if err != nil {
 		return ObjectInfo{}, err
