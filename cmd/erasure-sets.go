@@ -37,6 +37,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/dsync"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/console"
 	"github.com/minio/pkg/v2/sync/errgroup"
@@ -123,10 +124,10 @@ func connectEndpoint(endpoint Endpoint) (StorageAPI, *formatErasureV3, []byte, e
 		return nil, nil, nil, err
 	}
 
-	format, formatData, err := loadFormatErasureWithData(disk)
+	format, formatData, err := loadFormatErasureWithData(disk, false)
 	if err != nil {
 		if errors.Is(err, errUnformattedDisk) {
-			info, derr := disk.DiskInfo(context.TODO(), false)
+			info, derr := disk.DiskInfo(context.TODO(), DiskInfoOptions{})
 			if derr != nil && info.RootDisk {
 				disk.Close()
 				return nil, nil, nil, fmt.Errorf("Drive: %s is a root drive", disk)
@@ -667,10 +668,10 @@ func (s *erasureSets) Shutdown(ctx context.Context) error {
 	select {
 	case _, ok := <-s.setReconnectEvent:
 		if ok {
-			close(s.setReconnectEvent)
+			xioutil.SafeClose(s.setReconnectEvent)
 		}
 	default:
-		close(s.setReconnectEvent)
+		xioutil.SafeClose(s.setReconnectEvent)
 	}
 	return nil
 }

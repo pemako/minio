@@ -32,6 +32,7 @@ import (
 	"github.com/minio/kes-go"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
 	"github.com/minio/minio/internal/rest"
@@ -59,13 +60,13 @@ func init() {
 		getClusterHealthMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true}),
 		getIAMNodeMetrics(MetricsGroupOpts{dependGlobalAuthNPlugin: true, dependGlobalIAMSys: true}),
 		getReplicationSiteMetrics(MetricsGroupOpts{dependGlobalSiteReplicationSys: true}),
+		getBatchJobsMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true}),
 	}
 
 	peerMetricsGroups = []*MetricsGroup{
 		getGoMetrics(),
 		getHTTPMetrics(MetricsGroupOpts{}),
 		getNotificationMetrics(MetricsGroupOpts{dependGlobalLambdaTargetList: true}),
-		getLocalStorageMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true}),
 		getMinioProcMetrics(),
 		getMinioVersionMetrics(),
 		getNetworkMetrics(),
@@ -76,7 +77,8 @@ func init() {
 		getKMSNodeMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true, dependGlobalKMS: true}),
 		getMinioHealingMetrics(MetricsGroupOpts{dependGlobalBackgroundHealState: true}),
 		getWebhookMetrics(),
-		getReplicationClusterMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true, dependBucketTargetSys: true}),
+		getTierMetrics(),
+		getReplicationNodeMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true, dependBucketTargetSys: true}),
 	}
 
 	allMetricsGroups := func() (allMetrics []*MetricsGroup) {
@@ -96,13 +98,13 @@ func init() {
 		getDistLockMetrics(MetricsGroupOpts{dependGlobalIsDistErasure: true, dependGlobalLockServer: true}),
 		getIAMNodeMetrics(MetricsGroupOpts{dependGlobalAuthNPlugin: true, dependGlobalIAMSys: true}),
 		getLocalStorageMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true}),
+		getReplicationNodeMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true, dependBucketTargetSys: true}),
 	}
 
 	bucketMetricsGroups := []*MetricsGroup{
 		getBucketUsageMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true}),
 		getHTTPMetrics(MetricsGroupOpts{bucketOnly: true}),
 		getBucketTTFBMetric(),
-		getBatchJobsMetrics(MetricsGroupOpts{dependGlobalObjectAPI: true}),
 	}
 
 	bucketPeerMetricsGroups = []*MetricsGroup{
@@ -1724,7 +1726,7 @@ func getGoMetrics() *MetricsGroup {
 func getHistogramMetrics(hist *prometheus.HistogramVec, desc MetricDescription) []Metric {
 	ch := make(chan prometheus.Metric)
 	go func() {
-		defer close(ch)
+		defer xioutil.SafeClose(ch)
 		// Collects prometheus metrics from hist and sends it over ch
 		hist.Collect(ch)
 	}()
@@ -2136,7 +2138,7 @@ func getIAMNodeMetrics(opts MetricsGroupOpts) *MetricsGroup {
 }
 
 // replication metrics for each node - published to the cluster endpoint with nodename as label
-func getReplicationClusterMetrics(opts MetricsGroupOpts) *MetricsGroup {
+func getReplicationNodeMetrics(opts MetricsGroupOpts) *MetricsGroup {
 	mg := &MetricsGroup{
 		cacheInterval:    1 * time.Minute,
 		metricsGroupOpts: opts,
@@ -3374,6 +3376,16 @@ func getClusterHealthStatusMD() MetricDescription {
 	}
 }
 
+func getClusterErasureSetHealthStatusMD() MetricDescription {
+	return MetricDescription{
+		Namespace: clusterMetricNamespace,
+		Subsystem: "health",
+		Name:      "erasure_set_status",
+		Help:      "Get current health status for this erasure set",
+		Type:      gaugeMetric,
+	}
+}
+
 func getClusterErasureSetReadQuorumMD() MetricDescription {
 	return MetricDescription{
 		Namespace: clusterMetricNamespace,
@@ -3466,6 +3478,17 @@ func getClusterHealthMetrics(opts MetricsGroupOpts) *MetricsGroup {
 				Description:    getClusterErasureSetHealingDrivesMD(),
 				VariableLabels: labels,
 				Value:          float64(h.HealingDrives),
+			})
+
+			health := 1
+			if !h.Healthy {
+				health = 0
+			}
+
+			metrics = append(metrics, Metric{
+				Description:    getClusterErasureSetHealthStatusMD(),
+				VariableLabels: labels,
+				Value:          float64(health),
 			})
 		}
 
@@ -3881,7 +3904,7 @@ func (c *minioClusterCollector) Collect(out chan<- prometheus.Metric) {
 func ReportMetrics(ctx context.Context, metricsGroups []*MetricsGroup) <-chan Metric {
 	ch := make(chan Metric)
 	go func() {
-		defer close(ch)
+		defer xioutil.SafeClose(ch)
 		populateAndPublish(metricsGroups, func(m Metric) bool {
 			if m.VariableLabels == nil {
 				m.VariableLabels = make(map[string]string)
