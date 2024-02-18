@@ -80,7 +80,6 @@ type DiskInfo struct {
 type DiskMetrics struct {
 	LastMinute              map[string]AccElem `json:"apiLatencies,omitempty"`
 	APICalls                map[string]uint64  `json:"apiCalls,omitempty"`
-	TotalTokens             uint32             `json:"totalTokens,omitempty"`
 	TotalWaiting            uint32             `json:"totalWaiting,omitempty"`
 	TotalErrorsAvailability uint64             `json:"totalErrsAvailability"`
 	TotalErrorsTimeout      uint64             `json:"totalErrsTimeout"`
@@ -163,11 +162,6 @@ func (f *FileInfoVersions) findVersionIndex(v string) int {
 type RawFileInfo struct {
 	// Content of entire xl.meta (may contain data depending on what was requested by the caller.
 	Buf []byte `msg:"b,allownil"`
-
-	// DiskMTime indicates the mtime of the xl.meta on disk
-	// This is mainly used for detecting a particular issue
-	// reported in https://github.com/minio/minio/pull/13803
-	DiskMTime time.Time `msg:"dmt"`
 }
 
 // FileInfo - represents file stat information.
@@ -247,11 +241,6 @@ type FileInfo struct {
 	// no other caller must set this value other than multi-object delete call.
 	// usage in other calls in undefined please avoid.
 	Idx int `msg:"i"`
-
-	// DiskMTime indicates the mtime of the xl.meta on disk
-	// This is mainly used for detecting a particular issue
-	// reported in https://github.com/minio/minio/pull/13803
-	DiskMTime time.Time `msg:"dmt"`
 
 	// Combined checksum when object was uploaded.
 	Checksum []byte `msg:"cs,allownil"`
@@ -393,6 +382,7 @@ type DeleteVersionHandlerParams struct {
 type MetadataHandlerParams struct {
 	DiskID     string             `msg:"id"`
 	Volume     string             `msg:"v"`
+	OrigVolume string             `msg:"ov"`
 	FilePath   string             `msg:"fp"`
 	UpdateOpts UpdateMetadataOpts `msg:"uo"`
 	FI         FileInfo           `msg:"fi"`
@@ -449,4 +439,9 @@ type ReadAllHandlerParams struct {
 // RenameDataResp - RenameData()'s response.
 type RenameDataResp struct {
 	Signature uint64 `msg:"sig"`
+}
+
+// LocalDiskIDs - GetLocalIDs response.
+type LocalDiskIDs struct {
+	IDs []string
 }

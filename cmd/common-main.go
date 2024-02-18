@@ -105,6 +105,7 @@ func init() {
 	gob.Register(StorageErr(""))
 	gob.Register(madmin.TimeInfo{})
 	gob.Register(madmin.XFSErrorConfigs{})
+	gob.Register(map[string]string{})
 	gob.Register(map[string]interface{}{})
 
 	// All minio-go and madmin-go API operations shall be performed only once,
@@ -393,6 +394,7 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 	ctxt.UserTimeout = ctx.Duration("conn-user-timeout")
 	ctxt.ConnReadDeadline = ctx.Duration("conn-read-deadline")
 	ctxt.ConnWriteDeadline = ctx.Duration("conn-write-deadline")
+	ctxt.ConnClientReadDeadline = ctx.Duration("conn-client-read-deadline")
 
 	ctxt.ShutdownTimeout = ctx.Duration("shutdown-timeout")
 	ctxt.IdleTimeout = ctx.Duration("idle-timeout")
@@ -1034,7 +1036,7 @@ func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secu
 		}
 		if err = manager.AddCertificate(certFile, keyFile); err != nil {
 			err = fmt.Errorf("Unable to load TLS certificate '%s,%s': %w", certFile, keyFile, err)
-			logger.LogIf(GlobalContext, err, logger.Minio)
+			logger.LogIf(GlobalContext, err, logger.ErrorKind)
 		}
 	}
 	secureConn = true

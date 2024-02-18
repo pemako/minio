@@ -178,7 +178,10 @@ func shouldHealObjectOnDisk(erErr, dataErr error, meta FileInfo, latestMeta File
 	return false
 }
 
-const xMinIOHealing = ReservedMetadataPrefix + "healing"
+const (
+	xMinIOHealing = ReservedMetadataPrefix + "healing"
+	xMinIODataMov = ReservedMetadataPrefix + "data-mov"
+)
 
 // SetHealing marks object (version) as being healed.
 // Note: this is to be used only from healObject
@@ -193,6 +196,21 @@ func (fi *FileInfo) SetHealing() {
 // from healObject)
 func (fi FileInfo) Healing() bool {
 	_, ok := fi.Metadata[xMinIOHealing]
+	return ok
+}
+
+// SetDataMov marks object (version) as being currently
+// in movement, such as decommissioning or rebalance.
+func (fi *FileInfo) SetDataMov() {
+	if fi.Metadata == nil {
+		fi.Metadata = make(map[string]string)
+	}
+	fi.Metadata[xMinIODataMov] = "true"
+}
+
+// DataMov returns true if object is being in movement
+func (fi FileInfo) DataMov() bool {
+	_, ok := fi.Metadata[xMinIODataMov]
 	return ok
 }
 
@@ -230,7 +248,7 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 	}
 
 	// Re-read when we have lock...
-	partsMetadata, errs := readAllFileInfo(ctx, storageDisks, bucket, object, versionID, true, true)
+	partsMetadata, errs := readAllFileInfo(ctx, storageDisks, "", bucket, object, versionID, true, true)
 	if isAllNotFound(errs) {
 		err := errFileNotFound
 		if versionID != "" {
@@ -518,7 +536,7 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 					inlineBuffers[i] = bytes.NewBuffer(make([]byte, 0, erasure.ShardFileSize(latestMeta.Size)+32))
 					writers[i] = newStreamingBitrotWriterBuffer(inlineBuffers[i], DefaultBitrotAlgorithm, erasure.ShardSize())
 				} else {
-					writers[i] = newBitrotWriter(disk, minioMetaTmpBucket, partPath,
+					writers[i] = newBitrotWriter(disk, bucket, minioMetaTmpBucket, partPath,
 						tillOffset, DefaultBitrotAlgorithm, erasure.ShardSize())
 				}
 			}
@@ -796,7 +814,7 @@ func statAllDirs(ctx context.Context, storageDisks []StorageAPI, bucket, prefix 
 		}
 		index := index
 		g.Go(func() error {
-			entries, err := storageDisks[index].ListDir(ctx, bucket, prefix, 1)
+			entries, err := storageDisks[index].ListDir(ctx, "", bucket, prefix, 1)
 			if err != nil {
 				return err
 			}
@@ -808,6 +826,10 @@ func statAllDirs(ctx context.Context, storageDisks []StorageAPI, bucket, prefix 
 	}
 
 	return g.Wait()
+}
+
+func isAllVolumeNotFound(errs []error) bool {
+	return countErrs(errs, errVolumeNotFound) == len(errs)
 }
 
 // isAllNotFound will return if any element of the error slice is not
@@ -839,8 +861,12 @@ func isAllBucketsNotFound(errs []error) bool {
 	}
 	notFoundCount := 0
 	for _, err := range errs {
-		if err != nil && errors.Is(err, errVolumeNotFound) {
-			notFoundCount++
+		if err != nil {
+			if errors.Is(err, errVolumeNotFound) {
+				notFoundCount++
+			} else if isErrBucketNotFound(err) {
+				notFoundCount++
+			}
 		}
 	}
 	return len(errs) == notFoundCount
@@ -878,11 +904,10 @@ func isObjectDangling(metaArr []FileInfo, errs []error, dataErrs []error) (valid
 	// We can consider an object data not reliable
 	// when xl.meta is not found in read quorum disks.
 	// or when xl.meta is not readable in read quorum disks.
-	danglingErrsCount := func(cerrs []error) (int, int, int) {
+	danglingErrsCount := func(cerrs []error) (int, int) {
 		var (
 			notFoundCount      int
-			corruptedCount     int
-			driveNotFoundCount int
+			nonActionableCount int
 		)
 		for _, readErr := range cerrs {
 			if readErr == nil {
@@ -891,29 +916,16 @@ func isObjectDangling(metaArr []FileInfo, errs []error, dataErrs []error) (valid
 			switch {
 			case errors.Is(readErr, errFileNotFound) || errors.Is(readErr, errFileVersionNotFound):
 				notFoundCount++
-			case errors.Is(readErr, errFileCorrupt):
-				corruptedCount++
 			default:
 				// All other errors are non-actionable
-				driveNotFoundCount++
+				nonActionableCount++
 			}
 		}
-		return notFoundCount, corruptedCount, driveNotFoundCount
+		return notFoundCount, nonActionableCount
 	}
 
-	ndataErrs := make([]error, len(dataErrs))
-	for i := range dataErrs {
-		if errs[i] != dataErrs[i] {
-			// Only count part errors, if the error is not
-			// same as xl.meta error. This is to avoid
-			// double counting when both parts and xl.meta
-			// are not available.
-			ndataErrs[i] = dataErrs[i]
-		}
-	}
-
-	notFoundMetaErrs, corruptedMetaErrs, driveNotFoundMetaErrs := danglingErrsCount(errs)
-	notFoundPartsErrs, corruptedPartsErrs, driveNotFoundPartsErrs := danglingErrsCount(ndataErrs)
+	notFoundMetaErrs, nonActionableMetaErrs := danglingErrsCount(errs)
+	notFoundPartsErrs, nonActionablePartsErrs := danglingErrsCount(dataErrs)
 
 	for _, m := range metaArr {
 		if m.IsValid() {
@@ -923,10 +935,9 @@ func isObjectDangling(metaArr []FileInfo, errs []error, dataErrs []error) (valid
 	}
 
 	if !validMeta.IsValid() {
-		// validMeta is invalid because notFoundPartsErrs is
-		// greater than parity blocks, thus invalidating the FileInfo{}
-		// every dataErrs[i], metaArr[i] is an empty FileInfo{}
-		dataBlocks := (len(ndataErrs) + 1) / 2
+		// validMeta is invalid because all xl.meta is missing apparently
+		// we should figure out if dataDirs are also missing > dataBlocks.
+		dataBlocks := (len(dataErrs) + 1) / 2
 		if notFoundPartsErrs > dataBlocks {
 			// Not using parity to ensure that we do not delete
 			// any valid content, if any is recoverable. But if
@@ -943,25 +954,34 @@ func isObjectDangling(metaArr []FileInfo, errs []error, dataErrs []error) (valid
 		return validMeta, false
 	}
 
-	if driveNotFoundMetaErrs > 0 || driveNotFoundPartsErrs > 0 {
+	if nonActionableMetaErrs > 0 || nonActionablePartsErrs > 0 {
 		return validMeta, false
 	}
 
 	if validMeta.Deleted {
 		// notFoundPartsErrs is ignored since
 		// - delete marker does not have any parts
-		return validMeta, corruptedMetaErrs+notFoundMetaErrs > len(errs)/2
+		dataBlocks := (len(errs) + 1) / 2
+		return validMeta, notFoundMetaErrs > dataBlocks
 	}
 
-	totalErrs := notFoundMetaErrs + corruptedMetaErrs + notFoundPartsErrs + corruptedPartsErrs
-	if validMeta.IsRemote() {
-		// notFoundPartsErrs is ignored since
-		// - transition status of complete has no parts
-		totalErrs = notFoundMetaErrs + corruptedMetaErrs
+	// TODO: It is possible to replay the object via just single
+	// xl.meta file, considering quorum number of data-dirs are still
+	// present on other drives.
+	//
+	// However this requires a bit of a rewrite, leave this up for
+	// future work.
+	if notFoundMetaErrs > 0 && notFoundMetaErrs > validMeta.Erasure.ParityBlocks {
+		// All xl.meta is beyond data blocks missing, this is dangling
+		return validMeta, true
 	}
 
-	// We have valid meta, now verify if we have enough files with parity blocks.
-	return validMeta, totalErrs > validMeta.Erasure.ParityBlocks
+	if !validMeta.IsRemote() && notFoundPartsErrs > 0 && notFoundPartsErrs > validMeta.Erasure.ParityBlocks {
+		// All data-dir is beyond data blocks missing, this is dangling
+		return validMeta, true
+	}
+
+	return validMeta, false
 }
 
 // HealObject - heal the given object, automatically deletes the object if stale/corrupted if `remove` is true.
@@ -993,7 +1013,7 @@ func (er erasureObjects) HealObject(ctx context.Context, bucket, object, version
 
 	// Perform quick read without lock.
 	// This allows to quickly check if all is ok or all are missing.
-	_, errs := readAllFileInfo(healCtx, storageDisks, bucket, object, versionID, false, false)
+	_, errs := readAllFileInfo(healCtx, storageDisks, "", bucket, object, versionID, false, false)
 	if isAllNotFound(errs) {
 		err := errFileNotFound
 		if versionID != "" {

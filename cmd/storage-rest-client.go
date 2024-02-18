@@ -148,6 +148,8 @@ func toStorageErr(err error) error {
 		return errDiskOngoingReq
 	case grid.ErrUnknownHandler.Error():
 		return errInconsistentDisk
+	case grid.ErrDisconnected.Error():
+		return errDiskNotFound
 	}
 	return err
 }
@@ -311,7 +313,7 @@ func (client *storageRESTClient) DiskInfo(ctx context.Context, opts DiskInfoOpti
 
 	infop, err := storageDiskInfoHandler.Call(ctx, client.gridConn, &opts)
 	if err != nil {
-		return info, err
+		return info, toStorageErr(err)
 	}
 	info = *infop
 	if info.Error != "" {
@@ -346,6 +348,7 @@ func (client *storageRESTClient) StatVol(ctx context.Context, volume string) (vo
 		return vol, toStorageErr(err)
 	}
 	vol = *v
+	// Performs shallow copy, so we can reuse.
 	storageStatVolHandler.PutResponse(v)
 	return vol, nil
 }
@@ -366,11 +369,13 @@ func (client *storageRESTClient) AppendFile(ctx context.Context, volume string, 
 	return err
 }
 
-func (client *storageRESTClient) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error {
+func (client *storageRESTClient) CreateFile(ctx context.Context, origvolume, volume, path string, size int64, reader io.Reader) error {
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
 	values.Set(storageRESTLength, strconv.Itoa(int(size)))
+	values.Set(storageRESTOrigVolume, origvolume)
+
 	respBody, err := client.call(ctx, storageRESTMethodCreateFile, values, io.NopCloser(reader), size)
 	defer xhttp.DrainBody(respBody)
 	if err != nil {
@@ -380,12 +385,13 @@ func (client *storageRESTClient) CreateFile(ctx context.Context, volume, path st
 	return err
 }
 
-func (client *storageRESTClient) WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error {
+func (client *storageRESTClient) WriteMetadata(ctx context.Context, origvolume, volume, path string, fi FileInfo) error {
 	_, err := storageWriteMetadataHandler.Call(ctx, client.gridConn, &MetadataHandlerParams{
-		DiskID:   client.diskID,
-		Volume:   volume,
-		FilePath: path,
-		FI:       fi,
+		DiskID:     client.diskID,
+		OrigVolume: origvolume,
+		Volume:     volume,
+		FilePath:   path,
+		FI:         fi,
 	})
 	return toStorageErr(err)
 }
@@ -436,10 +442,6 @@ func (client *storageRESTClient) CheckParts(ctx context.Context, volume string, 
 
 // RenameData - rename source path to destination path atomically, metadata and data file.
 func (client *storageRESTClient) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (sign uint64, err error) {
-	// Set a very long timeout for rename data.
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-
 	resp, err := storageRenameDataHandler.Call(ctx, client.gridConn, &RenameDataHandlerParams{
 		DiskID:    client.diskID,
 		SrcVolume: srcVolume,
@@ -452,6 +454,7 @@ func (client *storageRESTClient) RenameData(ctx context.Context, srcVolume, srcP
 	if err != nil {
 		return 0, toStorageErr(err)
 	}
+	defer storageRenameDataHandler.PutResponse(resp)
 	return resp.Signature, nil
 }
 
@@ -478,16 +481,17 @@ func readMsgpReaderPoolPut(r *msgp.Reader) {
 	}
 }
 
-func (client *storageRESTClient) ReadVersion(ctx context.Context, volume, path, versionID string, opts ReadOptions) (fi FileInfo, err error) {
+func (client *storageRESTClient) ReadVersion(ctx context.Context, origvolume, volume, path, versionID string, opts ReadOptions) (fi FileInfo, err error) {
 	// Use websocket when not reading data.
 	if !opts.ReadData {
 		resp, err := storageReadVersionHandler.Call(ctx, client.gridConn, grid.NewMSSWith(map[string]string{
-			storageRESTDiskID:    client.diskID,
-			storageRESTVolume:    volume,
-			storageRESTFilePath:  path,
-			storageRESTVersionID: versionID,
-			storageRESTReadData:  strconv.FormatBool(opts.ReadData),
-			storageRESTHealing:   strconv.FormatBool(opts.Healing),
+			storageRESTDiskID:     client.diskID,
+			storageRESTOrigVolume: origvolume,
+			storageRESTVolume:     volume,
+			storageRESTFilePath:   path,
+			storageRESTVersionID:  versionID,
+			storageRESTReadData:   strconv.FormatBool(opts.ReadData),
+			storageRESTHealing:    strconv.FormatBool(opts.Healing),
 		}))
 		if err != nil {
 			return fi, toStorageErr(err)
@@ -496,6 +500,7 @@ func (client *storageRESTClient) ReadVersion(ctx context.Context, volume, path, 
 	}
 
 	values := make(url.Values)
+	values.Set(storageRESTOrigVolume, origvolume)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
 	values.Set(storageRESTVersionID, versionID)
@@ -612,11 +617,13 @@ func (client *storageRESTClient) ReadFile(ctx context.Context, volume string, pa
 }
 
 // ListDir - lists a directory.
-func (client *storageRESTClient) ListDir(ctx context.Context, volume, dirPath string, count int) (entries []string, err error) {
+func (client *storageRESTClient) ListDir(ctx context.Context, origvolume, volume, dirPath string, count int) (entries []string, err error) {
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTDirPath, dirPath)
 	values.Set(storageRESTCount, strconv.Itoa(count))
+	values.Set(storageRESTOrigVolume, origvolume)
+
 	respBody, err := client.call(ctx, storageRESTMethodListDir, values, nil, -1)
 	if err != nil {
 		return nil, err
@@ -693,10 +700,6 @@ func (client *storageRESTClient) DeleteVersions(ctx context.Context, volume stri
 
 // RenameFile - renames a file.
 func (client *storageRESTClient) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) (err error) {
-	// Set a very long timeout for rename file
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-
 	_, err = storageRenameFileHandler.Call(ctx, client.gridConn, &RenameFileHandlerParams{
 		DiskID:      client.diskID,
 		SrcVolume:   srcVolume,

@@ -30,14 +30,35 @@ func _() {
 	_ = x[HandlerRenameFile-19]
 	_ = x[HandlerReadAll-20]
 	_ = x[HandlerServerVerify-21]
-	_ = x[handlerTest-22]
-	_ = x[handlerTest2-23]
-	_ = x[handlerLast-24]
+	_ = x[HandlerTrace-22]
+	_ = x[HandlerListen-23]
+	_ = x[HandlerDeleteBucketMetadata-24]
+	_ = x[HandlerLoadBucketMetadata-25]
+	_ = x[HandlerReloadSiteReplicationConfig-26]
+	_ = x[HandlerReloadPoolMeta-27]
+	_ = x[HandlerStopRebalance-28]
+	_ = x[HandlerLoadRebalanceMeta-29]
+	_ = x[HandlerLoadTransitionTierConfig-30]
+	_ = x[HandlerDeletePolicy-31]
+	_ = x[HandlerLoadPolicy-32]
+	_ = x[HandlerLoadPolicyMapping-33]
+	_ = x[HandlerDeleteServiceAccount-34]
+	_ = x[HandlerLoadServiceAccount-35]
+	_ = x[HandlerDeleteUser-36]
+	_ = x[HandlerLoadUser-37]
+	_ = x[HandlerLoadGroup-38]
+	_ = x[HandlerHealBucket-39]
+	_ = x[HandlerMakeBucket-40]
+	_ = x[HandlerHeadBucket-41]
+	_ = x[HandlerDeleteBucket-42]
+	_ = x[handlerTest-43]
+	_ = x[handlerTest2-44]
+	_ = x[handlerLast-45]
 }
 
-const _HandlerID_name = "handlerInvalidLockLockLockRLockLockUnlockLockRUnlockLockRefreshLockForceUnlockWalkDirStatVolDiskInfoNSScannerReadXLReadVersionDeleteFileDeleteVersionUpdateMetadataWriteMetadataCheckPartsRenameDataRenameFileReadAllServerVerifyhandlerTesthandlerTest2handlerLast"
+const _HandlerID_name = "handlerInvalidLockLockLockRLockLockUnlockLockRUnlockLockRefreshLockForceUnlockWalkDirStatVolDiskInfoNSScannerReadXLReadVersionDeleteFileDeleteVersionUpdateMetadataWriteMetadataCheckPartsRenameDataRenameFileReadAllServerVerifyTraceListenDeleteBucketMetadataLoadBucketMetadataReloadSiteReplicationConfigReloadPoolMetaStopRebalanceLoadRebalanceMetaLoadTransitionTierConfigDeletePolicyLoadPolicyLoadPolicyMappingDeleteServiceAccountLoadServiceAccountDeleteUserLoadUserLoadGroupHealBucketMakeBucketHeadBucketDeleteBuckethandlerTesthandlerTest2handlerLast"
 
-var _HandlerID_index = [...]uint16{0, 14, 22, 31, 41, 52, 63, 78, 85, 92, 100, 109, 115, 126, 136, 149, 163, 176, 186, 196, 206, 213, 225, 236, 248, 259}
+var _HandlerID_index = [...]uint16{0, 14, 22, 31, 41, 52, 63, 78, 85, 92, 100, 109, 115, 126, 136, 149, 163, 176, 186, 196, 206, 213, 225, 230, 236, 256, 274, 301, 315, 328, 345, 369, 381, 391, 408, 428, 446, 456, 464, 473, 483, 493, 503, 515, 526, 538, 549}
 
 func (i HandlerID) String() string {
 	if i >= HandlerID(len(_HandlerID_index)-1) {

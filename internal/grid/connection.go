@@ -30,7 +30,6 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -176,10 +175,11 @@ func (c ContextDialer) DialContext(ctx context.Context, network, address string)
 
 const (
 	defaultOutQueue    = 10000
-	readBufferSize     = 16 << 10
-	writeBufferSize    = 16 << 10
+	readBufferSize     = 32 << 10 // 32 KiB is the most optimal on Linux
+	writeBufferSize    = 32 << 10 // 32 KiB is the most optimal on Linux
 	defaultDialTimeout = 2 * time.Second
 	connPingInterval   = 10 * time.Second
+	connWriteTimeout   = 3 * time.Second
 )
 
 type connectionParams struct {
@@ -287,6 +287,7 @@ func (c *Connection) newMuxClient(ctx context.Context) (*muxClient, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		client.deadline = getDeadline(time.Until(dl))
 		if client.deadline == 0 {
+			client.cancelFn(context.DeadlineExceeded)
 			return nil, context.DeadlineExceeded
 		}
 	}
@@ -333,6 +334,7 @@ func (c *Connection) Request(ctx context.Context, h HandlerID, req []byte) ([]by
 			_, ok := c.outgoing.Load(client.MuxID)
 			fmt.Println(client.MuxID, c.String(), "Connection.Request: DELETING MUX. Exists:", ok)
 		}
+		client.cancelFn(context.Canceled)
 		c.outgoing.Delete(client.MuxID)
 	}()
 	return client.traceRoundtrip(ctx, c.trace, h, req)
@@ -358,6 +360,7 @@ func (c *Subroute) Request(ctx context.Context, h HandlerID, req []byte) ([]byte
 		if debugReqs {
 			fmt.Println(client.MuxID, c.String(), "Subroute.Request: DELETING MUX")
 		}
+		client.cancelFn(context.Canceled)
 		c.outgoing.Delete(client.MuxID)
 	}()
 	return client.traceRoundtrip(ctx, c.trace, h, req)
@@ -599,6 +602,10 @@ func (c *Connection) sendMsg(conn net.Conn, msg message, payload msgp.MarshalSiz
 	if c.outgoingBytes != nil {
 		c.outgoingBytes(int64(len(dst)))
 	}
+	err = conn.SetWriteDeadline(time.Now().Add(connWriteTimeout))
+	if err != nil {
+		return err
+	}
 	return wsutil.WriteMessage(conn, c.side, ws.OpBinary, dst)
 }
 
@@ -647,7 +654,7 @@ func (c *Connection) connect() {
 				fmt.Printf("%v Connecting to %v: %v. Retrying.\n", c.Local, toDial, err)
 			}
 			sleep := defaultDialTimeout + time.Duration(rng.Int63n(int64(defaultDialTimeout)))
-			next := dialStarted.Add(sleep)
+			next := dialStarted.Add(sleep / 2)
 			sleep = time.Until(next).Round(time.Millisecond)
 			if sleep < 0 {
 				sleep = 0
@@ -659,8 +666,7 @@ func (c *Connection) connect() {
 			if gotState != StateConnecting {
 				// Don't print error on first attempt,
 				// and after that only once per hour.
-				cHour := strconv.FormatInt(time.Now().Unix()/60/60, 10)
-				logger.LogOnceIf(c.ctx, fmt.Errorf("grid: %s connecting to %s: %w (%T) Sleeping %v (%v)", c.Local, toDial, err, err, sleep, gotState), c.Local+toDial+cHour+err.Error())
+				logger.LogOnceIf(c.ctx, fmt.Errorf("grid: %s connecting to %s: %w (%T) Sleeping %v (%v)", c.Local, toDial, err, err, sleep, gotState), toDial)
 			}
 			c.updateState(StateConnectionError)
 			time.Sleep(sleep)
@@ -944,7 +950,7 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 				cancel(ErrDisconnected)
 				return
 			}
-			if cap(msg) > readBufferSize*8 {
+			if cap(msg) > readBufferSize*4 {
 				// Don't keep too much memory around.
 				msg = nil
 			}
@@ -1104,6 +1110,11 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 				return
 			}
 			PutByteBuffer(toSend)
+			err = conn.SetWriteDeadline(time.Now().Add(connWriteTimeout))
+			if err != nil {
+				logger.LogIf(ctx, fmt.Errorf("conn.SetWriteDeadline: %w", err))
+				return
+			}
 			_, err = buf.WriteTo(conn)
 			if err != nil {
 				logger.LogIf(ctx, fmt.Errorf("ws write: %w", err))
@@ -1143,6 +1154,11 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 			return
 		}
 		// buf is our local buffer, so we can reuse it.
+		err = conn.SetWriteDeadline(time.Now().Add(connWriteTimeout))
+		if err != nil {
+			logger.LogIf(ctx, fmt.Errorf("conn.SetWriteDeadline: %w", err))
+			return
+		}
 		_, err = buf.WriteTo(conn)
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("ws write: %w", err))
@@ -1372,7 +1388,7 @@ func (c *Connection) handleDisconnectClientMux(m message) {
 		if m.Flags&FlagPayloadIsErr != 0 {
 			v.error(RemoteErr(m.Payload))
 		} else {
-			v.error("remote disconnected")
+			v.error(ErrDisconnected)
 		}
 		return
 	}
@@ -1571,6 +1587,18 @@ func (c *Connection) debugMsg(d debugMsg, args ...any) {
 		c.clientPingInterval = args[0].(time.Duration)
 	case debugAddToDeadline:
 		c.addDeadline = args[0].(time.Duration)
+	case debugIsOutgoingClosed:
+		// params: muxID uint64, isClosed func(bool)
+		muxID := args[0].(uint64)
+		resp := args[1].(func(b bool))
+		mid, ok := c.outgoing.Load(muxID)
+		if !ok || mid == nil {
+			resp(true)
+			return
+		}
+		mid.respMu.Lock()
+		resp(mid.closed)
+		mid.respMu.Unlock()
 	}
 }
 

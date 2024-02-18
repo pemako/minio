@@ -39,22 +39,18 @@ import (
 // HighwayHash key for logging in anonymous mode
 var magicHighwayHash256Key = []byte("\x4b\xe7\x34\xfa\x8e\x23\x8a\xcd\x26\x3e\x83\xe6\xbb\x96\x85\x52\x04\x0f\x93\x5d\xa3\x9f\x44\x14\x97\xe0\x9d\x13\x22\xde\x36\xa0")
 
-// LogLevel type
-type LogLevel int8
-
 // Enumerated level types
 const (
-	InfoLvl LogLevel = iota + 1
-	ErrorLvl
-	FatalLvl
-
-	Application = madmin.LogKindApplication
-	Minio       = madmin.LogKindMinio
-	All         = madmin.LogKindAll
+	// Log types errors
+	FatalKind   = madmin.LogKindFatal
+	WarningKind = madmin.LogKindWarning
+	ErrorKind   = madmin.LogKindError
+	EventKind   = madmin.LogKindEvent
+	InfoKind    = madmin.LogKindInfo
 )
 
-// MinimumLogLevel holds the minimum logging level to print - info by default
-var MinimumLogLevel = InfoLvl
+// DisableErrorLog avoids printing error/event/info kind of logs
+var DisableErrorLog = false
 
 var trimStrings []string
 
@@ -65,18 +61,6 @@ var matchingFuncNames = [...]string{
 	"http.HandlerFunc.ServeHTTP",
 	"cmd.serverMain",
 	// add more here ..
-}
-
-func (level LogLevel) String() string {
-	switch level {
-	case InfoLvl:
-		return "INFO"
-	case ErrorLvl:
-		return "ERROR"
-	case FatalLvl:
-		return "FATAL"
-	}
-	return ""
 }
 
 // quietFlag: Hide startup messages if enabled
@@ -274,14 +258,28 @@ func LogIfNot(ctx context.Context, err error, ignored ...error) {
 }
 
 func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entry {
-	logKind := madmin.LogKindAll
+	var l string
+	if anonFlag {
+		l = reflect.TypeOf(err).String()
+	} else {
+		l = fmt.Sprintf("%v (%T)", err, err)
+	}
+	return buildLogEntry(ctx, l, getTrace(3), errKind...)
+}
+
+func logToEntry(ctx context.Context, message string, errKind ...interface{}) log.Entry {
+	return buildLogEntry(ctx, message, nil, errKind...)
+}
+
+func buildLogEntry(ctx context.Context, message string, trace []string, errKind ...interface{}) log.Entry {
+	logKind := madmin.LogKindError
 	if len(errKind) > 0 {
 		if ek, ok := errKind[0].(madmin.LogKind); ok {
 			logKind = ek
 		}
 	}
-	req := GetReqInfo(ctx)
 
+	req := GetReqInfo(ctx)
 	if req == nil {
 		req = &ReqInfo{
 			API:       "SYSTEM",
@@ -302,11 +300,7 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 		tags[entry.Key] = entry.Val
 	}
 
-	// Get full stack trace
-	trace := getTrace(3)
-
 	// Get the cause for the Error
-	message := fmt.Sprintf("%v (%T)", err, err)
 	deploymentID := req.DeploymentID
 	if req.DeploymentID == "" {
 		deploymentID = xhttp.GlobalDeploymentID
@@ -322,8 +316,7 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 
 	entry := log.Entry{
 		DeploymentID: deploymentID,
-		Level:        ErrorLvl.String(),
-		LogKind:      logKind,
+		Level:        logKind,
 		RemoteHost:   req.RemoteHost,
 		Host:         req.Host,
 		RequestID:    req.RequestID,
@@ -338,18 +331,22 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 				Objects:   objects,
 			},
 		},
-		Trace: &log.Trace{
+	}
+
+	if trace != nil {
+		entry.Trace = &log.Trace{
 			Message:   message,
 			Source:    trace,
 			Variables: tags,
-		},
+		}
+	} else {
+		entry.Message = message
 	}
 
 	if anonFlag {
 		entry.API.Args.Bucket = HashString(entry.API.Args.Bucket)
 		entry.API.Args.Object = HashString(entry.API.Args.Object)
 		entry.RemoteHost = HashString(entry.RemoteHost)
-		entry.Trace.Message = reflect.TypeOf(err).String()
 		entry.Trace.Variables = make(map[string]interface{})
 	}
 
@@ -359,10 +356,9 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 // consoleLogIf prints a detailed error message during
 // the execution of the server.
 func consoleLogIf(ctx context.Context, err error, errKind ...interface{}) {
-	if MinimumLogLevel > ErrorLvl {
+	if DisableErrorLog {
 		return
 	}
-
 	if consoleTgt != nil {
 		entry := errToEntry(ctx, err, errKind...)
 		consoleTgt.Send(ctx, entry)
@@ -372,25 +368,40 @@ func consoleLogIf(ctx context.Context, err error, errKind ...interface{}) {
 // logIf prints a detailed error message during
 // the execution of the server.
 func logIf(ctx context.Context, err error, errKind ...interface{}) {
-	if MinimumLogLevel > ErrorLvl {
+	if DisableErrorLog {
 		return
 	}
+	if err == nil {
+		return
+	}
+	entry := errToEntry(ctx, err, errKind...)
+	sendLog(ctx, entry)
+}
 
+func sendLog(ctx context.Context, entry log.Entry) {
 	systemTgts := SystemTargets()
 	if len(systemTgts) == 0 {
 		return
 	}
 
-	entry := errToEntry(ctx, err, errKind...)
 	// Iterate over all logger targets to send the log entry
 	for _, t := range systemTgts {
 		if err := t.Send(ctx, entry); err != nil {
-			if consoleTgt != nil {
+			if consoleTgt != nil { // Sending to the console never fails
 				entry.Trace.Message = fmt.Sprintf("event(%#v) was not sent to Logger target (%#v): %#v", entry, t, err)
 				consoleTgt.Send(ctx, entry)
 			}
 		}
 	}
+}
+
+// Event sends a event log to  log targets
+func Event(ctx context.Context, msg string, args ...interface{}) {
+	if DisableErrorLog {
+		return
+	}
+	entry := logToEntry(ctx, fmt.Sprintf(msg, args...), EventKind)
+	sendLog(ctx, entry)
 }
 
 // ErrCritical is the value panic'd whenever CriticalIf is called.

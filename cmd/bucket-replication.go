@@ -2235,6 +2235,7 @@ func proxyHeadToRepTarget(ctx context.Context, bucket, object string, rs *HTTPRa
 	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
 		return nil, oi, proxy
 	}
+	var perr error
 	for _, t := range proxyTargets.Targets {
 		tgt = globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
 		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -2264,6 +2265,7 @@ func proxyHeadToRepTarget(ctx context.Context, bucket, object string, rs *HTTPRa
 
 		objInfo, err := tgt.StatObject(ctx, t.TargetBucket, object, gopts)
 		if err != nil {
+			perr = err
 			if isErrInvalidRange(ErrorRespToObjectError(err, bucket, object)) {
 				return nil, oi, proxyResult{Err: err}
 			}
@@ -2300,6 +2302,7 @@ func proxyHeadToRepTarget(ctx context.Context, bucket, object string, rs *HTTPRa
 		}
 		return tgt, oi, proxyResult{Proxy: true}
 	}
+	proxy.Err = perr
 	return nil, oi, proxy
 }
 
@@ -2406,8 +2409,7 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 			taggedCount++
 			continue
 		}
-		errCode := minio.ToErrorResponse(err).Code
-		if errCode != "NoSuchKey" && errCode != "NoSuchVersion" {
+		if err != nil {
 			terr = err
 		}
 	}
@@ -2466,6 +2468,9 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 		if err == nil {
 			tgs, _ = tags.MapToObjectTags(tagSlc[idx])
 		}
+	}
+	if len(errs) == 1 {
+		proxy.Err = errs[0]
 	}
 	return tgs, proxy
 }
@@ -3213,6 +3218,9 @@ func queueReplicationHeal(ctx context.Context, bucket string, oi ObjectInfo, rcf
 		return roi
 	}
 
+	if isVeeamSOSAPIObject(oi.Name) {
+		return roi
+	}
 	if rcfg.Config == nil || rcfg.remotes == nil {
 		return roi
 	}
@@ -3385,12 +3393,12 @@ func (p *ReplicationPool) persistToDrive(ctx context.Context, v MRFReplicateEntr
 	}
 
 	globalLocalDrivesMu.RLock()
-	localDrives := globalLocalDrives
+	localDrives := cloneDrives(globalLocalDrives)
 	globalLocalDrivesMu.RUnlock()
 
 	for _, localDrive := range localDrives {
 		r := newReader()
-		err := localDrive.CreateFile(ctx, minioMetaBucket, pathJoin(replicationMRFDir, globalLocalNodeNameHex+".bin"), -1, r)
+		err := localDrive.CreateFile(ctx, "", minioMetaBucket, pathJoin(replicationMRFDir, globalLocalNodeNameHex+".bin"), -1, r)
 		r.Close()
 		if err == nil {
 			break
@@ -3452,7 +3460,7 @@ func (p *ReplicationPool) loadMRF() (mrfRec MRFReplicateEntries, err error) {
 	}
 
 	globalLocalDrivesMu.RLock()
-	localDrives := globalLocalDrives
+	localDrives := cloneDrives(globalLocalDrives)
 	globalLocalDrivesMu.RUnlock()
 
 	for _, localDrive := range localDrives {

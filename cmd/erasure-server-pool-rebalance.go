@@ -432,6 +432,8 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 		}
 	}()
 
+	logger.Event(ctx, "Pool %d rebalancing is started", poolIdx+1)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -455,6 +457,8 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 		stopFn(nil)
 		z.bucketRebalanceDone(bucket, poolIdx)
 	}
+
+	logger.Event(ctx, "Pool %d rebalancing is done", poolIdx+1)
 
 	return err
 }
@@ -809,7 +813,8 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 			}
 		}
 		_, err = z.CompleteMultipartUpload(ctx, bucket, oi.Name, res.UploadID, parts, ObjectOptions{
-			MTime: oi.ModTime,
+			DataMovement: true,
+			MTime:        oi.ModTime,
 		})
 		if err != nil {
 			err = fmt.Errorf("rebalanceObject: CompleteMultipartUpload() %w", err)
@@ -821,11 +826,13 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 	if err != nil {
 		return fmt.Errorf("rebalanceObject: hash.NewReader() %w", err)
 	}
+
 	_, err = z.PutObject(ctx,
 		bucket,
 		oi.Name,
 		NewPutObjReader(hr),
 		ObjectOptions{
+			DataMovement: true,
 			VersionID:    oi.VersionID,
 			MTime:        oi.ModTime,
 			UserDefined:  oi.UserDefined,

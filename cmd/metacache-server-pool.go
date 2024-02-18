@@ -58,9 +58,10 @@ func renameAllBucketMetacache(epPath string) error {
 // Other important fields are Limit, Marker.
 // List ID always derived from the Marker.
 func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (entries metaCacheEntriesSorted, err error) {
-	if err := checkListObjsArgs(ctx, o.Bucket, o.Prefix, o.Marker, z); err != nil {
+	if err := checkListObjsArgs(ctx, o.Bucket, o.Prefix, o.Marker); err != nil {
 		return entries, err
 	}
+
 	// Marker points to before the prefix, just ignore it.
 	if o.Marker < o.Prefix {
 		o.Marker = ""
@@ -304,16 +305,21 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 
 	cancelList()
 	wg.Wait()
+
+	// we should return 'errs' from per disk
+	if isAllNotFound(errs) {
+		if isAllVolumeNotFound(errs) {
+			return errVolumeNotFound
+		}
+		return nil
+	}
+
 	if err != nil {
 		return err
 	}
 
 	if contextCanceled(ctx) {
 		return ctx.Err()
-	}
-
-	if isAllNotFound(errs) {
-		return nil
 	}
 
 	for _, err := range errs {

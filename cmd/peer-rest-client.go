@@ -22,19 +22,20 @@ import (
 	"context"
 	"encoding/gob"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/bandwidth"
-	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/grid"
 	xhttp "github.com/minio/minio/internal/http"
-	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/pkg/v2/logger/message/log"
@@ -46,6 +47,66 @@ import (
 type peerRESTClient struct {
 	host       *xnet.Host
 	restClient *rest.Client
+	gridHost   string
+	// Function that returns the grid connection for this peer when initialized.
+	// Will return nil if the grid connection is not initialized yet.
+	gridConn func() *grid.Connection
+}
+
+// Returns a peer rest client.
+func newPeerRESTClient(peer *xnet.Host, gridHost string) *peerRESTClient {
+	scheme := "http"
+	if globalIsTLS {
+		scheme = "https"
+	}
+
+	serverURL := &url.URL{
+		Scheme: scheme,
+		Host:   peer.String(),
+		Path:   peerRESTPath,
+	}
+
+	restClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
+	// Use a separate client to avoid recursive calls.
+	healthClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
+	healthClient.NoMetrics = true
+
+	// Construct a new health function.
+	restClient.HealthCheckFn = func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), restClient.HealthCheckTimeout)
+		defer cancel()
+		respBody, err := healthClient.Call(ctx, peerRESTMethodHealth, nil, nil, -1)
+		xhttp.DrainBody(respBody)
+		return !isNetworkError(err)
+	}
+	var gridConn atomic.Pointer[grid.Connection]
+
+	return &peerRESTClient{
+		host: peer, restClient: restClient, gridHost: gridHost,
+		gridConn: func() *grid.Connection {
+			// Lazy initialization of grid connection.
+			// When we create this peer client, the grid connection is likely not yet initialized.
+			if gridHost == "" {
+				logger.LogOnceIf(context.Background(), fmt.Errorf("gridHost is empty for peer %s", peer.String()), peer.String()+":gridHost")
+				return nil
+			}
+			gc := gridConn.Load()
+			if gc != nil {
+				return gc
+			}
+			gm := globalGrid.Load()
+			if gm == nil {
+				return nil
+			}
+			gc = gm.Connection(gridHost)
+			if gc == nil {
+				logger.LogOnceIf(context.Background(), fmt.Errorf("gridHost %q not found for peer %s", gridHost, peer.String()), peer.String()+":gridHost")
+				return nil
+			}
+			gridConn.Store(gc)
+			return gc
+		},
+	}
 }
 
 // Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
@@ -117,8 +178,11 @@ func (client *peerRESTClient) LocalStorageInfo(metrics bool) (info StorageInfo, 
 }
 
 // ServerInfo - fetch server information for a remote node.
-func (client *peerRESTClient) ServerInfo() (info madmin.ServerProperties, err error) {
-	respBody, err := client.call(peerRESTMethodServerInfo, nil, nil, -1)
+func (client *peerRESTClient) ServerInfo(metrics bool) (info madmin.ServerProperties, err error) {
+	values := make(url.Values)
+	values.Set(peerRESTMetrics, strconv.FormatBool(metrics))
+
+	respBody, err := client.call(peerRESTMethodServerInfo, values, nil, -1)
 	if err != nil {
 		return
 	}
@@ -254,7 +318,7 @@ func (client *peerRESTClient) GetResourceMetrics(ctx context.Context) (<-chan Me
 	go func(ch chan<- Metric) {
 		defer func() {
 			xhttp.DrainBody(respBody)
-			xioutil.SafeClose(ch)
+			close(ch)
 		}()
 		for {
 			var metric Metric
@@ -347,134 +411,143 @@ func (client *peerRESTClient) GetAllBucketStats() (BucketStatsMap, error) {
 
 // LoadBucketMetadata - load bucket metadata
 func (client *peerRESTClient) LoadBucketMetadata(bucket string) error {
-	values := make(url.Values)
-	values.Set(peerRESTBucket, bucket)
-	respBody, err := client.call(peerRESTMethodLoadBucketMetadata, values, nil, -1)
-	if err != nil {
-		return err
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+	_, err := loadBucketMetadataHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTBucket: bucket,
+	}))
+	return err
 }
 
 // DeleteBucketMetadata - Delete bucket metadata
 func (client *peerRESTClient) DeleteBucketMetadata(bucket string) error {
-	values := make(url.Values)
-	values.Set(peerRESTBucket, bucket)
-	respBody, err := client.call(peerRESTMethodDeleteBucketMetadata, values, nil, -1)
-	if err != nil {
-		return err
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+	_, err := deleteBucketMetadataHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTBucket: bucket,
+	}))
+	return err
 }
 
 // DeletePolicy - delete a specific canned policy.
 func (client *peerRESTClient) DeletePolicy(policyName string) (err error) {
-	values := make(url.Values)
-	values.Set(peerRESTPolicy, policyName)
-
-	respBody, err := client.call(peerRESTMethodDeletePolicy, values, nil, -1)
-	if err != nil {
-		return
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+
+	_, err = deletePolicyHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTPolicy: policyName,
+	}))
+	return err
 }
 
 // LoadPolicy - reload a specific canned policy.
 func (client *peerRESTClient) LoadPolicy(policyName string) (err error) {
-	values := make(url.Values)
-	values.Set(peerRESTPolicy, policyName)
-
-	respBody, err := client.call(peerRESTMethodLoadPolicy, values, nil, -1)
-	if err != nil {
-		return
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+
+	_, err = loadPolicyHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTPolicy: policyName,
+	}))
+	return err
 }
 
 // LoadPolicyMapping - reload a specific policy mapping
 func (client *peerRESTClient) LoadPolicyMapping(userOrGroup string, userType IAMUserType, isGroup bool) error {
-	values := make(url.Values)
-	values.Set(peerRESTUserOrGroup, userOrGroup)
-	values.Set(peerRESTUserType, strconv.Itoa(int(userType)))
-	if isGroup {
-		values.Set(peerRESTIsGroup, "")
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
 
-	respBody, err := client.call(peerRESTMethodLoadPolicyMapping, values, nil, -1)
-	if err != nil {
-		return err
-	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+	_, err := loadPolicyMappingHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTUserOrGroup: userOrGroup,
+		peerRESTUserType:    strconv.Itoa(int(userType)),
+		peerRESTIsGroup:     strconv.FormatBool(isGroup),
+	}))
+	return err
 }
 
 // DeleteUser - delete a specific user.
 func (client *peerRESTClient) DeleteUser(accessKey string) (err error) {
-	values := make(url.Values)
-	values.Set(peerRESTUser, accessKey)
-
-	respBody, err := client.call(peerRESTMethodDeleteUser, values, nil, -1)
-	if err != nil {
-		return
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+
+	_, err = deleteUserHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTUser: accessKey,
+	}))
+	return err
 }
 
 // DeleteServiceAccount - delete a specific service account.
 func (client *peerRESTClient) DeleteServiceAccount(accessKey string) (err error) {
-	values := make(url.Values)
-	values.Set(peerRESTUser, accessKey)
-
-	respBody, err := client.call(peerRESTMethodDeleteServiceAccount, values, nil, -1)
-	if err != nil {
-		return
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+
+	_, err = deleteSvcActHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTUser: accessKey,
+	}))
+	return err
 }
 
 // LoadUser - reload a specific user.
 func (client *peerRESTClient) LoadUser(accessKey string, temp bool) (err error) {
-	values := make(url.Values)
-	values.Set(peerRESTUser, accessKey)
-	values.Set(peerRESTUserTemp, strconv.FormatBool(temp))
-
-	respBody, err := client.call(peerRESTMethodLoadUser, values, nil, -1)
-	if err != nil {
-		return
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+
+	_, err = loadUserHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTUser:     accessKey,
+		peerRESTUserTemp: strconv.FormatBool(temp),
+	}))
+	return err
 }
 
 // LoadServiceAccount - reload a specific service account.
 func (client *peerRESTClient) LoadServiceAccount(accessKey string) (err error) {
-	values := make(url.Values)
-	values.Set(peerRESTUser, accessKey)
-
-	respBody, err := client.call(peerRESTMethodLoadServiceAccount, values, nil, -1)
-	if err != nil {
-		return
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+
+	_, err = loadSvcActHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTUser: accessKey,
+	}))
+	return err
 }
 
 // LoadGroup - send load group command to peers.
 func (client *peerRESTClient) LoadGroup(group string) error {
-	values := make(url.Values)
-	values.Set(peerRESTGroup, group)
-	respBody, err := client.call(peerRESTMethodLoadGroup, values, nil, -1)
-	if err != nil {
-		return err
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+
+	_, err := loadGroupHandler.Call(context.Background(), conn, grid.NewMSSWith(map[string]string{
+		peerRESTGroup: group,
+	}))
+	return err
+}
+
+func (client *peerRESTClient) ReloadSiteReplicationConfig(ctx context.Context) error {
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
+	}
+
+	_, err := reloadSiteReplicationConfigHandler.Call(ctx, conn, grid.NewMSSWith(map[string]string{}))
+	return err
 }
 
 // VerifyBinary - sends verify binary message to remote peers.
@@ -528,19 +601,6 @@ func (client *peerRESTClient) BackgroundHealStatus() (madmin.BgHealState, error)
 	return state, err
 }
 
-// GetLocalDiskIDs - get a peer's local disks' IDs.
-func (client *peerRESTClient) GetLocalDiskIDs(ctx context.Context) (diskIDs []string) {
-	respBody, err := client.callWithContext(ctx, peerRESTMethodGetLocalDiskIDs, nil, nil, -1)
-	if err != nil {
-		return nil
-	}
-	defer xhttp.DrainBody(respBody)
-	if err = gob.NewDecoder(respBody).Decode(&diskIDs); err != nil {
-		return nil
-	}
-	return diskIDs
-}
-
 // GetMetacacheListing - get a new or existing metacache.
 func (client *peerRESTClient) GetMetacacheListing(ctx context.Context, o listPathOptions) (*metacache, error) {
 	if client == nil {
@@ -581,129 +641,98 @@ func (client *peerRESTClient) UpdateMetacacheListing(ctx context.Context, m meta
 }
 
 func (client *peerRESTClient) ReloadPoolMeta(ctx context.Context) error {
-	respBody, err := client.callWithContext(ctx, peerRESTMethodReloadPoolMeta, nil, nil, 0)
-	if err != nil {
-		return err
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+	_, err := reloadPoolMetaHandler.Call(ctx, conn, grid.NewMSSWith(map[string]string{}))
+	return err
 }
 
 func (client *peerRESTClient) StopRebalance(ctx context.Context) error {
-	respBody, err := client.callWithContext(ctx, peerRESTMethodStopRebalance, nil, nil, 0)
-	if err != nil {
-		return err
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+	_, err := stopRebalanceHandler.Call(ctx, conn, grid.NewMSSWith(map[string]string{}))
+	return err
 }
 
 func (client *peerRESTClient) LoadRebalanceMeta(ctx context.Context, startRebalance bool) error {
-	values := url.Values{}
-	values.Set(peerRESTStartRebalance, strconv.FormatBool(startRebalance))
-	respBody, err := client.callWithContext(ctx, peerRESTMethodLoadRebalanceMeta, values, nil, 0)
-	if err != nil {
-		return err
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+	_, err := loadRebalanceMetaHandler.Call(ctx, conn, grid.NewMSSWith(map[string]string{
+		peerRESTStartRebalance: strconv.FormatBool(startRebalance),
+	}))
+	return err
 }
 
 func (client *peerRESTClient) LoadTransitionTierConfig(ctx context.Context) error {
-	respBody, err := client.callWithContext(ctx, peerRESTMethodLoadTransitionTierConfig, nil, nil, 0)
-	if err != nil {
-		return err
+	conn := client.gridConn()
+	if conn == nil {
+		return nil
 	}
-	defer xhttp.DrainBody(respBody)
-	return nil
+	_, err := loadTransitionTierConfigHandler.Call(ctx, conn, grid.NewMSSWith(map[string]string{}))
+	return err
 }
 
-func (client *peerRESTClient) doTrace(traceCh chan<- madmin.TraceInfo, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
-	values := make(url.Values)
-	traceOpts.AddParams(values)
-
-	// To cancel the REST request in case doneCh gets closed.
-	ctx, cancel := context.WithCancel(GlobalContext)
-
-	cancelCh := make(chan struct{})
-	defer xioutil.SafeClose(cancelCh)
-	go func() {
-		select {
-		case <-doneCh:
-		case <-cancelCh:
-			// There was an error in the REST request.
-		}
-		cancel()
-	}()
-
-	respBody, err := client.callWithContext(ctx, peerRESTMethodTrace, values, nil, -1)
-	defer xhttp.DrainBody(respBody)
-
-	if err != nil {
+func (client *peerRESTClient) doTrace(ctx context.Context, traceCh chan<- []byte, traceOpts madmin.ServiceTraceOpts) {
+	gridConn := client.gridConn()
+	if gridConn == nil {
 		return
 	}
 
-	dec := gob.NewDecoder(respBody)
-	for {
-		var info madmin.TraceInfo
-		if err = dec.Decode(&info); err != nil {
-			return
-		}
-		if len(info.NodeName) > 0 {
-			select {
-			case traceCh <- info:
-			default:
-				// Do not block on slow receivers.
-			}
-		}
-	}
-}
-
-func (client *peerRESTClient) doListen(listenCh chan<- event.Event, doneCh <-chan struct{}, v url.Values) {
-	// To cancel the REST request in case doneCh gets closed.
-	ctx, cancel := context.WithCancel(GlobalContext)
-
-	cancelCh := make(chan struct{})
-	defer xioutil.SafeClose(cancelCh)
-	go func() {
-		select {
-		case <-doneCh:
-		case <-cancelCh:
-			// There was an error in the REST request.
-		}
-		cancel()
-	}()
-
-	respBody, err := client.callWithContext(ctx, peerRESTMethodListen, v, nil, -1)
-	defer xhttp.DrainBody(respBody)
-
+	payload, err := json.Marshal(traceOpts)
 	if err != nil {
+		logger.LogIf(ctx, err)
 		return
 	}
 
-	dec := gob.NewDecoder(respBody)
-	for {
-		var ev event.Event
-		if err := dec.Decode(&ev); err != nil {
-			return
-		}
-		if len(ev.EventVersion) > 0 {
-			select {
-			case listenCh <- ev:
-			default:
-				// Do not block on slow receivers.
-			}
-		}
+	st, err := gridConn.NewStream(ctx, grid.HandlerTrace, payload)
+	if err != nil {
+		return
 	}
+	st.Results(func(b []byte) error {
+		select {
+		case traceCh <- b:
+		default:
+			// Do not block on slow receivers.
+			// Just recycle the buffer.
+			grid.PutByteBuffer(b)
+		}
+		return nil
+	})
+}
+
+func (client *peerRESTClient) doListen(ctx context.Context, listenCh chan<- []byte, v url.Values) {
+	conn := client.gridConn()
+	if conn == nil {
+		return
+	}
+	st, err := listenHandler.Call(ctx, conn, grid.NewURLValuesWith(v))
+	if err != nil {
+		return
+	}
+	st.Results(func(b *grid.Bytes) error {
+		select {
+		case listenCh <- *b:
+		default:
+			// Do not block on slow receivers.
+			b.Recycle()
+		}
+		return nil
+	})
 }
 
 // Listen - listen on peers.
-func (client *peerRESTClient) Listen(listenCh chan<- event.Event, doneCh <-chan struct{}, v url.Values) {
+func (client *peerRESTClient) Listen(ctx context.Context, listenCh chan<- []byte, v url.Values) {
 	go func() {
 		for {
-			client.doListen(listenCh, doneCh, v)
+			client.doListen(ctx, listenCh, v)
 			select {
-			case <-doneCh:
+			case <-ctx.Done():
 				return
 			default:
 				// There was error in the REST request, retry after sometime as probably the peer is down.
@@ -714,12 +743,13 @@ func (client *peerRESTClient) Listen(listenCh chan<- event.Event, doneCh <-chan 
 }
 
 // Trace - send http trace request to peer nodes
-func (client *peerRESTClient) Trace(traceCh chan<- madmin.TraceInfo, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
+func (client *peerRESTClient) Trace(ctx context.Context, traceCh chan<- []byte, traceOpts madmin.ServiceTraceOpts) {
 	go func() {
 		for {
-			client.doTrace(traceCh, doneCh, traceOpts)
+			// Blocks until context is canceled or an error occurs.
+			client.doTrace(ctx, traceCh, traceOpts)
 			select {
-			case <-doneCh:
+			case <-ctx.Done():
 				return
 			default:
 				// There was error in the REST request, retry after sometime as probably the peer is down.
@@ -734,7 +764,7 @@ func (client *peerRESTClient) doConsoleLog(logCh chan log.Info, doneCh <-chan st
 	ctx, cancel := context.WithCancel(GlobalContext)
 
 	cancelCh := make(chan struct{})
-	defer xioutil.SafeClose(cancelCh)
+	defer close(cancelCh)
 	go func() {
 		select {
 		case <-doneCh:
@@ -789,6 +819,7 @@ func newPeerRestClients(endpoints EndpointServerPools) (remote, all []*peerRESTC
 		// Only useful in distributed setups
 		return nil, nil
 	}
+
 	hosts := endpoints.hostsSorted()
 	remote = make([]*peerRESTClient, 0, len(hosts))
 	all = make([]*peerRESTClient, len(hosts))
@@ -796,43 +827,13 @@ func newPeerRestClients(endpoints EndpointServerPools) (remote, all []*peerRESTC
 		if host == nil {
 			continue
 		}
-		all[i] = newPeerRESTClient(host)
+		all[i] = newPeerRESTClient(host, endpoints.FindGridHostsFromPeer(host))
 		remote = append(remote, all[i])
 	}
 	if len(all) != len(remote)+1 {
 		logger.LogIf(context.Background(), fmt.Errorf("WARNING: Expected number of all hosts (%v) to be remote +1 (%v)", len(all), len(remote)))
 	}
 	return remote, all
-}
-
-// Returns a peer rest client.
-func newPeerRESTClient(peer *xnet.Host) *peerRESTClient {
-	scheme := "http"
-	if globalIsTLS {
-		scheme = "https"
-	}
-
-	serverURL := &url.URL{
-		Scheme: scheme,
-		Host:   peer.String(),
-		Path:   peerRESTPath,
-	}
-
-	restClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
-	// Use a separate client to avoid recursive calls.
-	healthClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
-	healthClient.NoMetrics = true
-
-	// Construct a new health function.
-	restClient.HealthCheckFn = func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), restClient.HealthCheckTimeout)
-		defer cancel()
-		respBody, err := healthClient.Call(ctx, peerRESTMethodHealth, nil, nil, -1)
-		xhttp.DrainBody(respBody)
-		return !isNetworkError(err)
-	}
-
-	return &peerRESTClient{host: peer, restClient: restClient}
 }
 
 // MonitorBandwidth - send http trace request to peer nodes
@@ -861,7 +862,7 @@ func (client *peerRESTClient) GetPeerMetrics(ctx context.Context) (<-chan Metric
 	go func(ch chan<- Metric) {
 		defer func() {
 			xhttp.DrainBody(respBody)
-			xioutil.SafeClose(ch)
+			close(ch)
 		}()
 		for {
 			var metric Metric
@@ -888,7 +889,7 @@ func (client *peerRESTClient) GetPeerBucketMetrics(ctx context.Context) (<-chan 
 	go func(ch chan<- Metric) {
 		defer func() {
 			xhttp.DrainBody(respBody)
-			xioutil.SafeClose(ch)
+			close(ch)
 		}()
 		for {
 			var metric Metric
@@ -964,15 +965,6 @@ func (client *peerRESTClient) DriveSpeedTest(ctx context.Context, opts madmin.Dr
 	return result, nil
 }
 
-func (client *peerRESTClient) ReloadSiteReplicationConfig(ctx context.Context) error {
-	respBody, err := client.callWithContext(context.Background(), peerRESTMethodReloadSiteReplicationConfig, nil, nil, -1)
-	if err != nil {
-		return err
-	}
-	defer xhttp.DrainBody(respBody)
-	return nil
-}
-
 func (client *peerRESTClient) GetLastDayTierStats(ctx context.Context) (DailyAllTierStats, error) {
 	var result map[string]lastDayTierStats
 	respBody, err := client.callWithContext(context.Background(), peerRESTMethodGetLastDayTierStats, nil, nil, -1)
@@ -1026,7 +1018,7 @@ func (client *peerRESTClient) GetReplicationMRF(ctx context.Context, bucket stri
 	go func(ch chan madmin.ReplicationMRF) {
 		defer func() {
 			xhttp.DrainBody(respBody)
-			xioutil.SafeClose(ch)
+			close(ch)
 		}()
 		for {
 			var entry madmin.ReplicationMRF

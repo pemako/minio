@@ -22,9 +22,18 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/tinylib/msgp/msgp"
 )
+
+// Recycler will override the internal reuse in typed handlers.
+// When this is supported, the handler will not do internal pooling of objects,
+// call Recycle() when the object is no longer needed.
+// The recycler should handle nil pointers.
+type Recycler interface {
+	Recycle()
+}
 
 // MSS is a map[string]string that can be serialized.
 // It is not very efficient, but it is only used for easy parameter passing.
@@ -36,6 +45,14 @@ func (m *MSS) Get(key string) string {
 		return ""
 	}
 	return (*m)[key]
+}
+
+// Set a key, value pair.
+func (m *MSS) Set(key, value string) {
+	if m == nil {
+		*m = mssPool.Get().(map[string]string)
+	}
+	(*m)[key] = value
 }
 
 // UnmarshalMsg deserializes m from the provided byte slice and returns the
@@ -110,7 +127,10 @@ func (m *MSS) Msgsize() int {
 
 // NewMSS returns a new MSS.
 func NewMSS() *MSS {
-	m := MSS(make(map[string]string))
+	m := MSS(mssPool.Get().(map[string]string))
+	for k := range m {
+		delete(m, k)
+	}
 	return &m
 }
 
@@ -118,6 +138,20 @@ func NewMSS() *MSS {
 func NewMSSWith(m map[string]string) *MSS {
 	m2 := MSS(m)
 	return &m2
+}
+
+var mssPool = sync.Pool{
+	New: func() interface{} {
+		return make(map[string]string, 5)
+	},
+}
+
+// Recycle the underlying map.
+func (m *MSS) Recycle() {
+	if m != nil && *m != nil {
+		mssPool.Put(map[string]string(*m))
+		*m = nil
+	}
 }
 
 // ToQuery constructs a URL query string from the MSS, including "?" if there are any keys.
@@ -146,14 +180,33 @@ func (m MSS) ToQuery() string {
 }
 
 // NewBytes returns a new Bytes.
+// A slice is preallocated.
 func NewBytes() *Bytes {
 	b := Bytes(GetByteBuffer()[:0])
 	return &b
 }
 
 // NewBytesWith returns a new Bytes with the provided content.
+// When sent as a parameter, the caller gives up ownership of the byte slice.
+// When returned as response, the handler also gives up ownership of the byte slice.
 func NewBytesWith(b []byte) *Bytes {
 	bb := Bytes(b)
+	return &bb
+}
+
+// NewBytesWithCopyOf returns a new byte slice with a copy of the provided content.
+func NewBytesWithCopyOf(b []byte) *Bytes {
+	if b == nil {
+		bb := Bytes(nil)
+		return &bb
+	}
+	if len(b) < maxBufferSize {
+		bb := NewBytes()
+		*bb = append(*bb, b...)
+		return bb
+	}
+	bb := Bytes(make([]byte, len(b)))
+	copy(bb, b)
 	return &bb
 }
 
@@ -167,6 +220,9 @@ func (b *Bytes) UnmarshalMsg(bytes []byte) ([]byte, error) {
 		return bytes, errors.New("Bytes: UnmarshalMsg on nil pointer")
 	}
 	if bytes, err := msgp.ReadNilBytes(bytes); err == nil {
+		if *b != nil {
+			PutByteBuffer(*b)
+		}
 		*b = nil
 		return bytes, nil
 	}
@@ -178,7 +234,15 @@ func (b *Bytes) UnmarshalMsg(bytes []byte) ([]byte, error) {
 		*b = (*b)[:len(val)]
 		copy(*b, val)
 	} else {
-		*b = append(make([]byte, 0, len(val)), val...)
+		if cap(*b) == 0 && len(val) <= maxBufferSize {
+			*b = GetByteBuffer()[:0]
+		} else {
+			PutByteBuffer(*b)
+			*b = make([]byte, 0, len(val))
+		}
+		in := *b
+		in = append(in[:0], val...)
+		*b = in
 	}
 	return bytes, nil
 }
@@ -198,3 +262,160 @@ func (b *Bytes) Msgsize() int {
 	}
 	return msgp.ArrayHeaderSize + len(*b)
 }
+
+// Recycle puts the Bytes back into the pool.
+func (b *Bytes) Recycle() {
+	if b != nil && *b != nil {
+		*b = (*b)[:0]
+		PutByteBuffer(*b)
+		*b = nil
+	}
+}
+
+// URLValues can be used for url.Values.
+type URLValues map[string][]string
+
+var urlValuesPool = sync.Pool{
+	New: func() interface{} {
+		return make(map[string][]string, 10)
+	},
+}
+
+// NewURLValues returns a new URLValues.
+func NewURLValues() *URLValues {
+	u := URLValues(urlValuesPool.Get().(map[string][]string))
+	return &u
+}
+
+// NewURLValuesWith returns a new URLValues with the provided content.
+func NewURLValuesWith(values map[string][]string) *URLValues {
+	u := URLValues(values)
+	return &u
+}
+
+// Values returns the url.Values.
+// If u is nil, an empty url.Values is returned.
+// The values are a shallow copy of the underlying map.
+func (u *URLValues) Values() url.Values {
+	if u == nil {
+		return url.Values{}
+	}
+	return url.Values(*u)
+}
+
+// Recycle the underlying map.
+func (u *URLValues) Recycle() {
+	if *u != nil {
+		for key := range *u {
+			delete(*u, key)
+		}
+		val := map[string][]string(*u)
+		urlValuesPool.Put(val)
+		*u = nil
+	}
+}
+
+// MarshalMsg implements msgp.Marshaler
+func (u URLValues) MarshalMsg(b []byte) (o []byte, err error) {
+	o = msgp.Require(b, u.Msgsize())
+	o = msgp.AppendMapHeader(o, uint32(len(u)))
+	for zb0006, zb0007 := range u {
+		o = msgp.AppendString(o, zb0006)
+		o = msgp.AppendArrayHeader(o, uint32(len(zb0007)))
+		for zb0008 := range zb0007 {
+			o = msgp.AppendString(o, zb0007[zb0008])
+		}
+	}
+	return
+}
+
+// UnmarshalMsg implements msgp.Unmarshaler
+func (u *URLValues) UnmarshalMsg(bts []byte) (o []byte, err error) {
+	var zb0004 uint32
+	zb0004, bts, err = msgp.ReadMapHeaderBytes(bts)
+	if err != nil {
+		err = msgp.WrapError(err)
+		return
+	}
+	if *u == nil {
+		*u = urlValuesPool.Get().(map[string][]string)
+	}
+	if len(*u) > 0 {
+		for key := range *u {
+			delete(*u, key)
+		}
+	}
+
+	for zb0004 > 0 {
+		var zb0001 string
+		var zb0002 []string
+		zb0004--
+		zb0001, bts, err = msgp.ReadStringBytes(bts)
+		if err != nil {
+			err = msgp.WrapError(err)
+			return
+		}
+		var zb0005 uint32
+		zb0005, bts, err = msgp.ReadArrayHeaderBytes(bts)
+		if err != nil {
+			err = msgp.WrapError(err, zb0001)
+			return
+		}
+		if cap(zb0002) >= int(zb0005) {
+			zb0002 = zb0002[:zb0005]
+		} else {
+			zb0002 = make([]string, zb0005)
+		}
+		for zb0003 := range zb0002 {
+			zb0002[zb0003], bts, err = msgp.ReadStringBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, zb0001, zb0003)
+				return
+			}
+		}
+		(*u)[zb0001] = zb0002
+	}
+	o = bts
+	return
+}
+
+// Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+func (u URLValues) Msgsize() (s int) {
+	s = msgp.MapHeaderSize
+	if u != nil {
+		for zb0006, zb0007 := range u {
+			_ = zb0007
+			s += msgp.StringPrefixSize + len(zb0006) + msgp.ArrayHeaderSize
+			for zb0008 := range zb0007 {
+				s += msgp.StringPrefixSize + len(zb0007[zb0008])
+			}
+		}
+	}
+	return
+}
+
+// NoPayload is a type that can be used for handlers that do not use a payload.
+type NoPayload struct{}
+
+// Msgsize returns 0.
+func (p NoPayload) Msgsize() int {
+	return 0
+}
+
+// UnmarshalMsg satisfies the interface, but is a no-op.
+func (NoPayload) UnmarshalMsg(bytes []byte) ([]byte, error) {
+	return bytes, nil
+}
+
+// MarshalMsg satisfies the interface, but is a no-op.
+func (NoPayload) MarshalMsg(bytes []byte) ([]byte, error) {
+	return bytes, nil
+}
+
+// NewNoPayload returns an empty NoPayload struct.
+func NewNoPayload() NoPayload {
+	return NoPayload{}
+}
+
+// Recycle is a no-op.
+func (NoPayload) Recycle() {}

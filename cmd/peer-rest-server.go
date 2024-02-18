@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/gob"
 	"encoding/hex"
@@ -29,6 +30,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +39,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	b "github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/grid"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
@@ -59,192 +62,151 @@ func (s *peerRESTServer) GetLocksHandler(w http.ResponseWriter, r *http.Request)
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(globalLockServer.DupLockMap()))
 }
 
-// DeletePolicyHandler - deletes a policy on the server.
-func (s *peerRESTServer) DeletePolicyHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
+var (
+	deletePolicyHandler      = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerDeletePolicy, grid.NewMSS, grid.NewNoPayload)
+	loadPolicyHandler        = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadPolicy, grid.NewMSS, grid.NewNoPayload)
+	loadPolicyMappingHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadPolicyMapping, grid.NewMSS, grid.NewNoPayload)
+	deleteSvcActHandler      = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerDeleteServiceAccount, grid.NewMSS, grid.NewNoPayload)
+	loadSvcActHandler        = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadServiceAccount, grid.NewMSS, grid.NewNoPayload)
+	deleteUserHandler        = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerDeleteUser, grid.NewMSS, grid.NewNoPayload)
+	loadUserHandler          = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadUser, grid.NewMSS, grid.NewNoPayload)
+	loadGroupHandler         = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadGroup, grid.NewMSS, grid.NewNoPayload)
+)
 
+// DeletePolicyHandler - deletes a policy on the server.
+func (s *peerRESTServer) DeletePolicyHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	vars := mux.Vars(r)
-	policyName := vars[peerRESTPolicy]
+	policyName := mss.Get(peerRESTPolicy)
 	if policyName == "" {
-		s.writeErrorResponse(w, errors.New("policyName is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("policyName is missing"))
 	}
 
-	if err := globalIAMSys.DeletePolicy(r.Context(), policyName, false); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	if err := globalIAMSys.DeletePolicy(context.Background(), policyName, false); err != nil {
+		return np, grid.NewRemoteErr(err)
 	}
+
+	return
 }
 
 // LoadPolicyHandler - reloads a policy on the server.
-func (s *peerRESTServer) LoadPolicyHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
+func (s *peerRESTServer) LoadPolicyHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	vars := mux.Vars(r)
-	policyName := vars[peerRESTPolicy]
+	policyName := mss.Get(peerRESTPolicy)
 	if policyName == "" {
-		s.writeErrorResponse(w, errors.New("policyName is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("policyName is missing"))
 	}
 
-	if err := globalIAMSys.LoadPolicy(r.Context(), objAPI, policyName); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	if err := globalIAMSys.LoadPolicy(context.Background(), objAPI, policyName); err != nil {
+		return np, grid.NewRemoteErr(err)
 	}
+
+	return
 }
 
 // LoadPolicyMappingHandler - reloads a policy mapping on the server.
-func (s *peerRESTServer) LoadPolicyMappingHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
+func (s *peerRESTServer) LoadPolicyMappingHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
-
-	userOrGroup := r.Form.Get(peerRESTUserOrGroup)
+	userOrGroup := mss.Get(peerRESTUserOrGroup)
 	if userOrGroup == "" {
-		s.writeErrorResponse(w, errors.New("user-or-group is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("user-or-group is missing"))
 	}
 
-	userType, err := strconv.Atoi(r.Form.Get(peerRESTUserType))
+	userType, err := strconv.Atoi(mss.Get(peerRESTUserType))
 	if err != nil {
-		s.writeErrorResponse(w, fmt.Errorf("user-type `%s` is invalid: %w", r.Form.Get(peerRESTUserType), err))
-		return
+		return np, grid.NewRemoteErr(fmt.Errorf("user-type `%s` is invalid: %w", mss.Get(peerRESTUserType), err))
 	}
 
-	_, isGroup := r.Form[peerRESTIsGroup]
-	if err := globalIAMSys.LoadPolicyMapping(r.Context(), objAPI, userOrGroup, IAMUserType(userType), isGroup); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	isGroup := mss.Get(peerRESTIsGroup) == "true"
+	if err := globalIAMSys.LoadPolicyMapping(context.Background(), objAPI, userOrGroup, IAMUserType(userType), isGroup); err != nil {
+		return np, grid.NewRemoteErr(err)
 	}
+
+	return
 }
 
 // DeleteServiceAccountHandler - deletes a service account on the server.
-func (s *peerRESTServer) DeleteServiceAccountHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
+func (s *peerRESTServer) DeleteServiceAccountHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	vars := mux.Vars(r)
-	accessKey := vars[peerRESTUser]
+	accessKey := mss.Get(peerRESTUser)
 	if accessKey == "" {
-		s.writeErrorResponse(w, errors.New("service account name is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("service account name is missing"))
 	}
 
-	if err := globalIAMSys.DeleteServiceAccount(r.Context(), accessKey, false); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	if err := globalIAMSys.DeleteServiceAccount(context.Background(), accessKey, false); err != nil {
+		return np, grid.NewRemoteErr(err)
 	}
+
+	return
 }
 
 // LoadServiceAccountHandler - reloads a service account on the server.
-func (s *peerRESTServer) LoadServiceAccountHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
+func (s *peerRESTServer) LoadServiceAccountHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	vars := mux.Vars(r)
-	accessKey := vars[peerRESTUser]
+	accessKey := mss.Get(peerRESTUser)
 	if accessKey == "" {
-		s.writeErrorResponse(w, errors.New("service account parameter is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("service account name is missing"))
 	}
 
-	if err := globalIAMSys.LoadServiceAccount(r.Context(), accessKey); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	if err := globalIAMSys.LoadServiceAccount(context.Background(), accessKey); err != nil {
+		return np, grid.NewRemoteErr(err)
 	}
+
+	return
 }
 
 // DeleteUserHandler - deletes a user on the server.
-func (s *peerRESTServer) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
+func (s *peerRESTServer) DeleteUserHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	vars := mux.Vars(r)
-	accessKey := vars[peerRESTUser]
+	accessKey := mss.Get(peerRESTUser)
 	if accessKey == "" {
-		s.writeErrorResponse(w, errors.New("username is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("username is missing"))
 	}
 
-	if err := globalIAMSys.DeleteUser(r.Context(), accessKey, false); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	if err := globalIAMSys.DeleteUser(context.Background(), accessKey, false); err != nil {
+		return np, grid.NewRemoteErr(err)
 	}
+
+	return
 }
 
 // LoadUserHandler - reloads a user on the server.
-func (s *peerRESTServer) LoadUserHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
+func (s *peerRESTServer) LoadUserHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	vars := mux.Vars(r)
-	accessKey := vars[peerRESTUser]
+	accessKey := mss.Get(peerRESTUser)
 	if accessKey == "" {
-		s.writeErrorResponse(w, errors.New("username is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("username is missing"))
 	}
 
-	temp, err := strconv.ParseBool(vars[peerRESTUserTemp])
+	temp, err := strconv.ParseBool(mss.Get(peerRESTUserTemp))
 	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+		return np, grid.NewRemoteErr(err)
 	}
 
 	userType := regUser
@@ -252,32 +214,31 @@ func (s *peerRESTServer) LoadUserHandler(w http.ResponseWriter, r *http.Request)
 		userType = stsUser
 	}
 
-	if err = globalIAMSys.LoadUser(r.Context(), objAPI, accessKey, userType); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	if err = globalIAMSys.LoadUser(context.Background(), objAPI, accessKey, userType); err != nil {
+		return np, grid.NewRemoteErr(err)
 	}
+
+	return
 }
 
 // LoadGroupHandler - reloads group along with members list.
-func (s *peerRESTServer) LoadGroupHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
+func (s *peerRESTServer) LoadGroupHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	vars := mux.Vars(r)
-	group := vars[peerRESTGroup]
-	err := globalIAMSys.LoadGroup(r.Context(), objAPI, group)
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	group := mss.Get(peerRESTGroup)
+	if group == "" {
+		return np, grid.NewRemoteErr(errors.New("group is missing"))
 	}
+
+	err := globalIAMSys.LoadGroup(context.Background(), objAPI, group)
+	if err != nil {
+		return np, grid.NewRemoteErr(err)
+	}
+
+	return
 }
 
 // StartProfilingHandler - Issues the start profiling command.
@@ -367,7 +328,19 @@ func (s *peerRESTServer) ServerInfoHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	ctx := newContext(r, w, "ServerInfo")
-	info := getLocalServerProperty(globalEndpoints, r)
+	objLayer := newObjectLayerFn()
+	if objLayer == nil {
+		s.writeErrorResponse(w, errServerNotInitialized)
+		return
+	}
+
+	metrics, err := strconv.ParseBool(r.Form.Get(peerRESTMetrics))
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+
+	info := getLocalServerProperty(globalEndpoints, r, metrics)
 
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
@@ -564,18 +537,13 @@ func (s *peerRESTServer) GetSysErrorsHandler(w http.ResponseWriter, r *http.Requ
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(info))
 }
 
-// DeleteBucketMetadataHandler - Delete in memory bucket metadata
-func (s *peerRESTServer) DeleteBucketMetadataHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
+var deleteBucketMetadataHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerDeleteBucketMetadata, grid.NewMSS, grid.NewNoPayload)
 
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
+// DeleteBucketMetadataHandler - Delete in memory bucket metadata
+func (s *peerRESTServer) DeleteBucketMetadataHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+	bucketName := mss.Get(peerRESTBucket)
 	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("Bucket name is missing"))
 	}
 
 	globalReplicationStats.Delete(bucketName)
@@ -587,24 +555,7 @@ func (s *peerRESTServer) DeleteBucketMetadataHandler(w http.ResponseWriter, r *h
 	if localMetacacheMgr != nil {
 		localMetacacheMgr.deleteBucketCache(bucketName)
 	}
-}
-
-// ReloadSiteReplicationConfigHandler - reloads site replication configuration from the disks
-func (s *peerRESTServer) ReloadSiteReplicationConfigHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	ctx := newContext(r, w, "LoadSiteReplication")
-
-	objAPI := newObjectLayerFn()
-	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	logger.LogIf(r.Context(), globalSiteReplicationSys.Init(ctx, objAPI))
+	return
 }
 
 // GetAllBucketStatsHandler - fetches bucket replication stats for all buckets from this peer.
@@ -619,6 +570,7 @@ func (s *peerRESTServer) GetAllBucketStatsHandler(w http.ResponseWriter, r *http
 	for k, v := range replicationStats {
 		bucketStatsMap[k] = BucketStats{
 			ReplicationStats: v,
+			ProxyStats:       globalReplicationStats.getProxyStats(k),
 		}
 	}
 	logger.LogIf(r.Context(), msgp.Encode(w, &BucketStatsMap{Stats: bucketStatsMap, Timestamp: UTCNow()}))
@@ -642,6 +594,7 @@ func (s *peerRESTServer) GetBucketStatsHandler(w http.ResponseWriter, r *http.Re
 	bs := BucketStats{
 		ReplicationStats: globalReplicationStats.Get(bucketName),
 		QueueStats:       ReplicationQueueStats{Nodes: []ReplQNodeStats{globalReplicationStats.getNodeQueueStats(bucketName)}},
+		ProxyStats:       globalReplicationStats.getProxyStats(bucketName),
 	}
 	logger.LogIf(r.Context(), msgp.Encode(w, &bs))
 }
@@ -662,30 +615,23 @@ func (s *peerRESTServer) GetSRMetricsHandler(w http.ResponseWriter, r *http.Requ
 	logger.LogIf(r.Context(), msgp.Encode(w, &sm))
 }
 
-// LoadBucketMetadataHandler - reloads in memory bucket metadata
-func (s *peerRESTServer) LoadBucketMetadataHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
+var loadBucketMetadataHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadBucketMetadata, grid.NewMSS, grid.NewNoPayload)
 
-	vars := mux.Vars(r)
-	bucketName := vars[peerRESTBucket]
+// LoadBucketMetadataHandler - reloads in memory bucket metadata
+func (s *peerRESTServer) LoadBucketMetadataHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+	bucketName := mss.Get(peerRESTBucket)
 	if bucketName == "" {
-		s.writeErrorResponse(w, errors.New("Bucket name is missing"))
-		return
+		return np, grid.NewRemoteErr(errors.New("Bucket name is missing"))
 	}
 
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	meta, err := loadBucketMetadata(r.Context(), objAPI, bucketName)
+	meta, err := loadBucketMetadata(context.Background(), objAPI, bucketName)
 	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+		return np, grid.NewRemoteErr(err)
 	}
 
 	globalBucketMetadataSys.Set(bucketName, meta)
@@ -697,6 +643,8 @@ func (s *peerRESTServer) LoadBucketMetadataHandler(w http.ResponseWriter, r *htt
 	if meta.bucketTargetConfig != nil {
 		globalBucketTargetSys.UpdateAllTargets(bucketName, meta.bucketTargetConfig)
 	}
+
+	return
 }
 
 func (s *peerRESTServer) GetMetacacheListingHandler(w http.ResponseWriter, r *http.Request) {
@@ -767,64 +715,9 @@ func (s *peerRESTServer) PutBucketNotificationHandler(w http.ResponseWriter, r *
 	globalEventNotifier.AddRulesMap(bucketName, rulesMap)
 }
 
-// Return disk IDs of all the local disks.
-func getLocalDiskIDs(z *erasureServerPools) []string {
-	var ids []string
-
-	for poolIdx := range z.serverPools {
-		for _, set := range z.serverPools[poolIdx].sets {
-			disks := set.getDisks()
-			for _, disk := range disks {
-				if disk == nil {
-					continue
-				}
-				if disk.IsLocal() {
-					id, err := disk.GetDiskID()
-					if err != nil {
-						continue
-					}
-					if id == "" {
-						continue
-					}
-					ids = append(ids, id)
-				}
-			}
-		}
-	}
-
-	return ids
-}
-
 // HealthHandler - returns true of health
 func (s *peerRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	s.IsValid(w, r)
-}
-
-// GetLocalDiskIDs - Return disk IDs of all the local disks.
-func (s *peerRESTServer) GetLocalDiskIDs(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
-	ctx := newContext(r, w, "GetLocalDiskIDs")
-
-	objLayer := newObjectLayerFn()
-
-	// Service not initialized yet
-	if objLayer == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	z, ok := objLayer.(*erasureServerPools)
-	if !ok {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
-	}
-
-	ids := getLocalDiskIDs(z)
-	logger.LogIf(ctx, gob.NewEncoder(w).Encode(ids))
 }
 
 // VerifyBinary - verifies the downloaded binary is in-tact
@@ -892,16 +785,19 @@ func (s *peerRESTServer) CommitBinaryHandler(w http.ResponseWriter, r *http.Requ
 var errUnsupportedSignal = fmt.Errorf("unsupported signal")
 
 func waitingDrivesNode() map[string]madmin.DiskMetrics {
-	errs := make([]error, len(globalLocalDrives))
-	infos := make([]DiskInfo, len(globalLocalDrives))
-	for i, drive := range globalLocalDrives {
+	globalLocalDrivesMu.RLock()
+	localDrives := cloneDrives(globalLocalDrives)
+	globalLocalDrivesMu.RUnlock()
+
+	errs := make([]error, len(localDrives))
+	infos := make([]DiskInfo, len(localDrives))
+	for i, drive := range localDrives {
 		infos[i], errs[i] = drive.DiskInfo(GlobalContext, DiskInfoOptions{})
 	}
 	infoMaps := make(map[string]madmin.DiskMetrics)
 	for i := range infos {
 		if infos[i].Metrics.TotalWaiting >= 1 && errors.Is(errs[i], errFaultyDisk) {
 			infoMaps[infos[i].Endpoint] = madmin.DiskMetrics{
-				TotalTokens:  infos[i].Metrics.TotalTokens,
 				TotalWaiting: infos[i].Metrics.TotalWaiting,
 			}
 		}
@@ -976,25 +872,23 @@ func (s *peerRESTServer) SignalServiceHandler(w http.ResponseWriter, r *http.Req
 	}
 }
 
+// Set an output capacity of 100 for listenHandler
+// There is another buffer that will buffer events.
+var listenHandler = grid.NewStream[*grid.URLValues, grid.NoPayload, *grid.Bytes](grid.HandlerListen,
+	grid.NewURLValues, nil, grid.NewBytes).WithOutCapacity(100)
+
 // ListenHandler sends http trace messages back to peer rest client
-func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
-
-	values := r.Form
-
+func (s *peerRESTServer) ListenHandler(ctx context.Context, v *grid.URLValues, out chan<- *grid.Bytes) *grid.RemoteErr {
+	values := v.Values()
+	defer v.Recycle()
 	var prefix string
 	if len(values[peerRESTListenPrefix]) > 1 {
-		s.writeErrorResponse(w, errors.New("invalid request"))
-		return
+		return grid.NewRemoteErrString("invalid request (peerRESTListenPrefix)")
 	}
-
+	globalAPIConfig.getRequestsPoolCapacity()
 	if len(values[peerRESTListenPrefix]) == 1 {
 		if err := event.ValidateFilterRuleValue(values[peerRESTListenPrefix][0]); err != nil {
-			s.writeErrorResponse(w, err)
-			return
+			return grid.NewRemoteErr(err)
 		}
 
 		prefix = values[peerRESTListenPrefix][0]
@@ -1002,14 +896,12 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 
 	var suffix string
 	if len(values[peerRESTListenSuffix]) > 1 {
-		s.writeErrorResponse(w, errors.New("invalid request"))
-		return
+		return grid.NewRemoteErrString("invalid request (peerRESTListenSuffix)")
 	}
 
 	if len(values[peerRESTListenSuffix]) == 1 {
 		if err := event.ValidateFilterRuleValue(values[peerRESTListenSuffix][0]); err != nil {
-			s.writeErrorResponse(w, err)
-			return
+			return grid.NewRemoteErr(err)
 		}
 
 		suffix = values[peerRESTListenSuffix][0]
@@ -1022,8 +914,7 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 	for _, ev := range values[peerRESTListenEvents] {
 		eventName, err := event.ParseName(ev)
 		if err != nil {
-			s.writeErrorResponse(w, err)
-			return
+			return grid.NewRemoteErr(err)
 		}
 		mask.MergeMaskable(eventName)
 		eventNames = append(eventNames, eventName)
@@ -1031,13 +922,10 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 
 	rulesMap := event.NewRulesMap(eventNames, pattern, event.TargetID{ID: mustGetUUID()})
 
-	doneCh := r.Context().Done()
-
 	// Listen Publisher uses nonblocking publish and hence does not wait for slow subscribers.
 	// Use buffered channel to take care of burst sends or slow w.Write()
 	ch := make(chan event.Event, globalAPIConfig.getRequestsPoolCapacity())
-
-	err := globalHTTPListen.Subscribe(mask, ch, doneCh, func(ev event.Event) bool {
+	err := globalHTTPListen.Subscribe(mask, ch, ctx.Done(), func(ev event.Event) bool {
 		if ev.S3.Bucket.Name != "" && values.Get(peerRESTListenBucket) != "" {
 			if ev.S3.Bucket.Name != values.Get(peerRESTListenBucket) {
 				return false
@@ -1046,83 +934,58 @@ func (s *peerRESTServer) ListenHandler(w http.ResponseWriter, r *http.Request) {
 		return rulesMap.MatchSimple(ev.EventName, ev.S3.Object.Key)
 	})
 	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+		return grid.NewRemoteErr(err)
 	}
-	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
-	defer keepAliveTicker.Stop()
 
-	enc := gob.NewEncoder(w)
+	// Process until remote disconnects.
+	// Blocks on upstream (out) congestion.
+	// We have however a dynamic downstream buffer (ch).
+	buf := bytes.NewBuffer(grid.GetByteBuffer())
+	enc := json.NewEncoder(buf)
+	tmpEvt := struct{ Records []event.Event }{[]event.Event{{}}}
 	for {
 		select {
+		case <-ctx.Done():
+			grid.PutByteBuffer(buf.Bytes())
+			return nil
 		case ev := <-ch:
-			if err := enc.Encode(ev); err != nil {
-				return
+			buf.Reset()
+			tmpEvt.Records[0] = ev
+			if err := enc.Encode(tmpEvt); err != nil {
+				logger.LogOnceIf(ctx, err, "event: Encode failed")
+				continue
 			}
-			if len(ch) == 0 {
-				// Flush if nothing is queued
-				w.(http.Flusher).Flush()
-			}
-		case <-r.Context().Done():
-			return
-		case <-keepAliveTicker.C:
-			if err := enc.Encode(&event.Event{}); err != nil {
-				return
-			}
-			w.(http.Flusher).Flush()
+			out <- grid.NewBytesWithCopyOf(buf.Bytes())
 		}
 	}
 }
 
 // TraceHandler sends http trace messages back to peer rest client
-func (s *peerRESTServer) TraceHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
-	}
-
+func (s *peerRESTServer) TraceHandler(ctx context.Context, payload []byte, _ <-chan []byte, out chan<- []byte) *grid.RemoteErr {
 	var traceOpts madmin.ServiceTraceOpts
-	err := traceOpts.ParseParams(r)
+	err := json.Unmarshal(payload, &traceOpts)
 	if err != nil {
-		s.writeErrorResponse(w, errors.New("Invalid request"))
-		return
+		return grid.NewRemoteErr(err)
 	}
+	var wg sync.WaitGroup
 
 	// Trace Publisher uses nonblocking publish and hence does not wait for slow subscribers.
 	// Use buffered channel to take care of burst sends or slow w.Write()
-	ch := make(chan madmin.TraceInfo, 100000)
-	err = globalTrace.Subscribe(traceOpts.TraceTypes(), ch, r.Context().Done(), func(entry madmin.TraceInfo) bool {
+	err = globalTrace.SubscribeJSON(traceOpts.TraceTypes(), out, ctx.Done(), func(entry madmin.TraceInfo) bool {
 		return shouldTrace(entry, traceOpts)
-	})
+	}, &wg)
 	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+		return grid.NewRemoteErr(err)
 	}
 
 	// Publish bootstrap events that have already occurred before client could subscribe.
 	if traceOpts.TraceTypes().Contains(madmin.TraceBootstrap) {
-		go globalBootstrapTracer.Publish(r.Context(), globalTrace)
+		go globalBootstrapTracer.Publish(ctx, globalTrace)
 	}
 
-	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
-	defer keepAliveTicker.Stop()
-
-	enc := gob.NewEncoder(w)
-	for {
-		select {
-		case entry := <-ch:
-			if err := enc.Encode(entry); err != nil {
-				return
-			}
-		case <-r.Context().Done():
-			return
-		case <-keepAliveTicker.C:
-			if err := enc.Encode(&madmin.TraceInfo{}); err != nil {
-				return
-			}
-			w.(http.Flusher).Flush()
-		}
-	}
+	// Wait for remote to cancel and SubscribeJSON to exit.
+	wg.Wait()
+	return nil
 }
 
 func (s *peerRESTServer) BackgroundHealStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -1141,92 +1004,101 @@ func (s *peerRESTServer) BackgroundHealStatusHandler(w http.ResponseWriter, r *h
 	logger.LogIf(ctx, gob.NewEncoder(w).Encode(state))
 }
 
-func (s *peerRESTServer) ReloadPoolMetaHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
+var reloadSiteReplicationConfigHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerReloadSiteReplicationConfig, grid.NewMSS, grid.NewNoPayload)
+
+// ReloadSiteReplicationConfigHandler - reloads site replication configuration from the disks
+func (s *peerRESTServer) ReloadSiteReplicationConfigHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
-	pools, ok := objAPI.(*erasureServerPools)
-	if !ok {
-		return
-	}
-	if err := pools.ReloadPoolMeta(r.Context()); err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
+	logger.LogIf(context.Background(), globalSiteReplicationSys.Init(context.Background(), objAPI))
+	return
 }
 
-func (s *peerRESTServer) StopRebalanceHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("invalid request"))
+var reloadPoolMetaHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerReloadPoolMeta, grid.NewMSS, grid.NewNoPayload)
+
+func (s *peerRESTServer) ReloadPoolMetaHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		return np, grid.NewRemoteErr(errServerNotInitialized)
+	}
+
+	pools, ok := objAPI.(*erasureServerPools)
+	if !ok {
 		return
 	}
 
+	if err := pools.ReloadPoolMeta(context.Background()); err != nil {
+		return np, grid.NewRemoteErr(err)
+	}
+
+	return
+}
+
+var stopRebalanceHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerStopRebalance, grid.NewMSS, grid.NewNoPayload)
+
+func (s *peerRESTServer) StopRebalanceHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
+
 	pools, ok := objAPI.(*erasureServerPools)
 	if !ok {
-		s.writeErrorResponse(w, errors.New("not a multiple pools setup"))
-		return
+		return np, grid.NewRemoteErr(errors.New("not a pooled setup"))
 	}
 
 	pools.StopRebalance()
+	return
 }
 
-func (s *peerRESTServer) LoadRebalanceMetaHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
+var loadRebalanceMetaHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadRebalanceMeta, grid.NewMSS, grid.NewNoPayload)
 
+func (s *peerRESTServer) LoadRebalanceMetaHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		s.writeErrorResponse(w, errServerNotInitialized)
-		return
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
 
 	pools, ok := objAPI.(*erasureServerPools)
 	if !ok {
-		s.writeErrorResponse(w, errors.New("not a multiple pools setup"))
-		return
+		return np, grid.NewRemoteErr(errors.New("not a pooled setup"))
 	}
 
-	startRebalanceStr := r.Form.Get(peerRESTStartRebalance)
-	startRebalance, err := strconv.ParseBool(startRebalanceStr)
+	startRebalance, err := strconv.ParseBool(mss.Get(peerRESTStartRebalance))
 	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+		return np, grid.NewRemoteErr(err)
 	}
 
-	if err := pools.loadRebalanceMeta(r.Context()); err != nil {
-		s.writeErrorResponse(w, err)
-		return
+	if err := pools.loadRebalanceMeta(context.Background()); err != nil {
+		return np, grid.NewRemoteErr(err)
 	}
+
 	if startRebalance {
 		go pools.StartRebalance()
 	}
+
+	return
 }
 
-func (s *peerRESTServer) LoadTransitionTierConfigHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		s.writeErrorResponse(w, errors.New("invalid request"))
-		return
+var loadTransitionTierConfigHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadTransitionTierConfig, grid.NewMSS, grid.NewNoPayload)
+
+func (s *peerRESTServer) LoadTransitionTierConfigHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		return np, grid.NewRemoteErr(errServerNotInitialized)
 	}
+
 	go func() {
 		err := globalTierConfigMgr.Reload(context.Background(), newObjectLayerFn())
 		if err != nil {
 			logger.LogIf(context.Background(), fmt.Errorf("Failed to reload remote tier config %s", err))
 		}
 	}()
+
+	return
 }
 
 // ConsoleLogHandler sends console logs of this node back to peer rest client
@@ -1521,8 +1393,91 @@ func (s *peerRESTServer) NetSpeedTestHandler(w http.ResponseWriter, r *http.Requ
 	logger.LogIf(r.Context(), gob.NewEncoder(w).Encode(result))
 }
 
+var healBucketHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerHealBucket, grid.NewMSS, grid.NewNoPayload)
+
+func (s *peerRESTServer) HealBucketHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+	bucket := mss.Get(peerS3Bucket)
+	if isMinioMetaBucket(bucket) {
+		return np, grid.NewRemoteErr(errInvalidArgument)
+	}
+
+	bucketDeleted := mss.Get(peerS3BucketDeleted) == "true"
+	_, err := healBucketLocal(context.Background(), bucket, madmin.HealOpts{
+		Remove: bucketDeleted,
+	})
+	if err != nil {
+		return np, grid.NewRemoteErr(err)
+	}
+
+	return np, nil
+}
+
+var headBucketHandler = grid.NewSingleHandler[*grid.MSS, *VolInfo](grid.HandlerHeadBucket, grid.NewMSS, func() *VolInfo { return &VolInfo{} })
+
+// HeadBucketHandler implements peer BuckeInfo call, returns bucket create date.
+func (s *peerRESTServer) HeadBucketHandler(mss *grid.MSS) (info *VolInfo, nerr *grid.RemoteErr) {
+	bucket := mss.Get(peerS3Bucket)
+	if isMinioMetaBucket(bucket) {
+		return info, grid.NewRemoteErr(errInvalidArgument)
+	}
+
+	bucketDeleted := mss.Get(peerS3BucketDeleted) == "true"
+
+	bucketInfo, err := getBucketInfoLocal(context.Background(), bucket, BucketOptions{
+		Deleted: bucketDeleted,
+	})
+	if err != nil {
+		return info, grid.NewRemoteErr(err)
+	}
+
+	return &VolInfo{
+		Name:    bucketInfo.Name,
+		Created: bucketInfo.Created,
+	}, nil
+}
+
+var deleteBucketHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerDeleteBucket, grid.NewMSS, grid.NewNoPayload)
+
+// DeleteBucketHandler implements peer delete bucket call.
+func (s *peerRESTServer) DeleteBucketHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+	bucket := mss.Get(peerS3Bucket)
+	if isMinioMetaBucket(bucket) {
+		return np, grid.NewRemoteErr(errInvalidArgument)
+	}
+
+	forceDelete := mss.Get(peerS3BucketForceDelete) == "true"
+	err := deleteBucketLocal(context.Background(), bucket, DeleteBucketOptions{
+		Force: forceDelete,
+	})
+	if err != nil {
+		return np, grid.NewRemoteErr(err)
+	}
+
+	return np, nil
+}
+
+var makeBucketHandler = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerMakeBucket, grid.NewMSS, grid.NewNoPayload)
+
+// MakeBucketHandler implements peer create bucket call.
+func (s *peerRESTServer) MakeBucketHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+	bucket := mss.Get(peerS3Bucket)
+	if isMinioMetaBucket(bucket) {
+		return np, grid.NewRemoteErr(errInvalidArgument)
+	}
+
+	forceCreate := mss.Get(peerS3BucketForceCreate) == "true"
+	err := makeBucketLocal(context.Background(), bucket, MakeBucketOptions{
+		ForceCreate: forceCreate,
+	})
+	if err != nil {
+		return np, grid.NewRemoteErr(err)
+	}
+
+	return np, nil
+}
+
 // registerPeerRESTHandlers - register peer rest router.
-func registerPeerRESTHandlers(router *mux.Router) {
+func registerPeerRESTHandlers(router *mux.Router, gm *grid.Manager) {
 	h := func(f http.HandlerFunc) http.HandlerFunc {
 		return collectInternodeStats(httpTraceHdrs(f))
 	}
@@ -1531,7 +1486,7 @@ func registerPeerRESTHandlers(router *mux.Router) {
 	subrouter := router.PathPrefix(peerRESTPrefix).Subrouter()
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodHealth).HandlerFunc(h(server.HealthHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetLocks).HandlerFunc(h(server.GetLocksHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerInfo).HandlerFunc(h(server.ServerInfoHandler))
+	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodServerInfo).HandlerFunc(h(server.ServerInfoHandler)).Queries(restQueries(peerRESTMetrics)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLocalStorageInfo).HandlerFunc(h(server.LocalStorageInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodProcInfo).HandlerFunc(h(server.GetProcInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodMemInfo).HandlerFunc(h(server.GetMemInfoHandler))
@@ -1545,43 +1500,54 @@ func registerPeerRESTHandlers(router *mux.Router) {
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodNetHwInfo).HandlerFunc(h(server.GetNetInfoHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCPUInfo).HandlerFunc(h(server.GetCPUsHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetAllBucketStats).HandlerFunc(h(server.GetAllBucketStatsHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteBucketMetadata).HandlerFunc(h(server.DeleteBucketMetadataHandler)).Queries(restQueries(peerRESTBucket)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadBucketMetadata).HandlerFunc(h(server.LoadBucketMetadataHandler)).Queries(restQueries(peerRESTBucket)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetBucketStats).HandlerFunc(h(server.GetBucketStatsHandler)).Queries(restQueries(peerRESTBucket)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodSignalService).HandlerFunc(h(server.SignalServiceHandler)).Queries(restQueries(peerRESTSignal)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodVerifyBinary).HandlerFunc(h(server.VerifyBinaryHandler)).Queries(restQueries(peerRESTURL, peerRESTSha256Sum, peerRESTReleaseInfo)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodCommitBinary).HandlerFunc(h(server.CommitBinaryHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeletePolicy).HandlerFunc(h(server.DeletePolicyHandler)).Queries(restQueries(peerRESTPolicy)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadPolicy).HandlerFunc(h(server.LoadPolicyHandler)).Queries(restQueries(peerRESTPolicy)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadPolicyMapping).HandlerFunc(h(server.LoadPolicyMappingHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteUser).HandlerFunc(h(server.DeleteUserHandler)).Queries(restQueries(peerRESTUser)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDeleteServiceAccount).HandlerFunc(h(server.DeleteServiceAccountHandler)).Queries(restQueries(peerRESTUser)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadUser).HandlerFunc(h(server.LoadUserHandler)).Queries(restQueries(peerRESTUser, peerRESTUserTemp)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadServiceAccount).HandlerFunc(h(server.LoadServiceAccountHandler)).Queries(restQueries(peerRESTUser)...)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadGroup).HandlerFunc(h(server.LoadGroupHandler)).Queries(restQueries(peerRESTGroup)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetReplicationMRF).HandlerFunc(httpTraceHdrs(server.GetReplicationMRFHandler)).Queries(restQueries(peerRESTBucket)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetSRMetrics).HandlerFunc(h(server.GetSRMetricsHandler))
 
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodStartProfiling).HandlerFunc(h(server.StartProfilingHandler)).Queries(restQueries(peerRESTProfiler)...)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDownloadProfilingData).HandlerFunc(h(server.DownloadProfilingDataHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodTrace).HandlerFunc(server.TraceHandler)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodListen).HandlerFunc(h(server.ListenHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodBackgroundHealStatus).HandlerFunc(server.BackgroundHealStatusHandler)
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLog).HandlerFunc(server.ConsoleLogHandler)
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetLocalDiskIDs).HandlerFunc(h(server.GetLocalDiskIDs))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetBandwidth).HandlerFunc(h(server.GetBandwidth))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetMetacacheListing).HandlerFunc(h(server.GetMetacacheListingHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodUpdateMetacacheListing).HandlerFunc(h(server.UpdateMetacacheListingHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetPeerMetrics).HandlerFunc(h(server.GetPeerMetrics))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetPeerBucketMetrics).HandlerFunc(h(server.GetPeerBucketMetrics))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadTransitionTierConfig).HandlerFunc(h(server.LoadTransitionTierConfigHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodSpeedTest).HandlerFunc(h(server.SpeedTestHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDriveSpeedTest).HandlerFunc(h(server.DriveSpeedTestHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodNetperf).HandlerFunc(h(server.NetSpeedTestHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodDevNull).HandlerFunc(h(server.DevNull))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodReloadSiteReplicationConfig).HandlerFunc(h(server.ReloadSiteReplicationConfigHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodReloadPoolMeta).HandlerFunc(h(server.ReloadPoolMetaHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodLoadRebalanceMeta).HandlerFunc(h(server.LoadRebalanceMetaHandler))
-	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodStopRebalance).HandlerFunc(h(server.StopRebalanceHandler))
 	subrouter.Methods(http.MethodPost).Path(peerRESTVersionPrefix + peerRESTMethodGetLastDayTierStats).HandlerFunc(h(server.GetLastDayTierStatsHandler))
+
+	logger.FatalIf(makeBucketHandler.Register(gm, server.MakeBucketHandler), "unable to register handler")
+	logger.FatalIf(deleteBucketHandler.Register(gm, server.DeleteBucketHandler), "unable to register handler")
+	logger.FatalIf(headBucketHandler.Register(gm, server.HeadBucketHandler), "unable to register handler")
+	logger.FatalIf(healBucketHandler.Register(gm, server.HealBucketHandler), "unable to register handler")
+
+	logger.FatalIf(deletePolicyHandler.Register(gm, server.DeletePolicyHandler), "unable to register handler")
+	logger.FatalIf(loadPolicyHandler.Register(gm, server.LoadPolicyHandler), "unable to register handler")
+	logger.FatalIf(loadPolicyMappingHandler.Register(gm, server.LoadPolicyMappingHandler), "unable to register handler")
+	logger.FatalIf(deleteUserHandler.Register(gm, server.DeleteUserHandler), "unable to register handler")
+	logger.FatalIf(deleteSvcActHandler.Register(gm, server.DeleteServiceAccountHandler), "unable to register handler")
+	logger.FatalIf(loadUserHandler.Register(gm, server.LoadUserHandler), "unable to register handler")
+	logger.FatalIf(loadSvcActHandler.Register(gm, server.LoadServiceAccountHandler), "unable to register handler")
+	logger.FatalIf(loadGroupHandler.Register(gm, server.LoadGroupHandler), "unable to register handler")
+
+	logger.FatalIf(loadTransitionTierConfigHandler.Register(gm, server.LoadTransitionTierConfigHandler), "unable to register handler")
+	logger.FatalIf(reloadPoolMetaHandler.Register(gm, server.ReloadPoolMetaHandler), "unable to register handler")
+	logger.FatalIf(loadRebalanceMetaHandler.Register(gm, server.LoadRebalanceMetaHandler), "unable to register handler")
+	logger.FatalIf(stopRebalanceHandler.Register(gm, server.StopRebalanceHandler), "unable to register handler")
+	logger.FatalIf(reloadSiteReplicationConfigHandler.Register(gm, server.ReloadSiteReplicationConfigHandler), "unable to register handler")
+	logger.FatalIf(loadBucketMetadataHandler.Register(gm, server.LoadBucketMetadataHandler), "unable to register handler")
+	logger.FatalIf(deleteBucketMetadataHandler.Register(gm, server.DeleteBucketMetadataHandler), "unable to register handler")
+	logger.FatalIf(listenHandler.RegisterNoInput(gm, server.ListenHandler), "unable to register handler")
+	logger.FatalIf(gm.RegisterStreamingHandler(grid.HandlerTrace, grid.StreamHandler{
+		Handle:      server.TraceHandler,
+		Subroute:    "",
+		OutCapacity: 100000,
+		InCapacity:  0,
+	}), "unable to register handler")
 }

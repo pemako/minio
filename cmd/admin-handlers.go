@@ -50,6 +50,7 @@ import (
 	"github.com/minio/madmin-go/v3/estream"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/dsync"
+	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
@@ -429,6 +430,8 @@ func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Req
 // ServiceHandler - POST /minio/admin/v3/service?action={action}
 // ----------
 // Supports following actions:
+// - restart (restarts all the MinIO instances in a setup)
+// - stop (stops all the MinIO instances in a setup)
 // - freeze (freezes all incoming S3 API calls)
 // - unfreeze (unfreezes previously frozen S3 API calls)
 func (a adminAPIHandlers) ServiceHandler(w http.ResponseWriter, r *http.Request) {
@@ -438,25 +441,30 @@ func (a adminAPIHandlers) ServiceHandler(w http.ResponseWriter, r *http.Request)
 	action := vars["action"]
 
 	var serviceSig serviceSignal
-	switch act := madmin.ServiceAction(action); act {
+	switch madmin.ServiceAction(action) {
+	case madmin.ServiceActionRestart:
+		serviceSig = serviceRestart
+	case madmin.ServiceActionStop:
+		serviceSig = serviceStop
 	case madmin.ServiceActionFreeze:
 		serviceSig = serviceFreeze
 	case madmin.ServiceActionUnfreeze:
 		serviceSig = serviceUnFreeze
 	default:
-		process := act == madmin.ServiceActionRestart || act == madmin.ServiceActionStop
-		if process {
-			apiErr := errorCodes.ToAPIErr(ErrMalformedPOSTRequest)
-			apiErr.Description = "process actions are not supported via this API anymore, please upgrade 'mc' or madmin-go to use ServiceV2() API"
-			writeErrorResponseJSON(ctx, w, apiErr, r.URL)
-			return
-		}
-		logger.LogIf(ctx, fmt.Errorf("Unrecognized service action %s requested", action), logger.Application)
+		logger.LogIf(ctx, fmt.Errorf("Unrecognized service action %s requested", action), logger.ErrorKind)
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrMalformedPOSTRequest), r.URL)
 		return
 	}
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ServiceFreezeAdminAction)
+	var objectAPI ObjectLayer
+	switch serviceSig {
+	case serviceRestart:
+		objectAPI, _ = validateAdminReq(ctx, w, r, policy.ServiceRestartAdminAction)
+	case serviceStop:
+		objectAPI, _ = validateAdminReq(ctx, w, r, policy.ServiceStopAdminAction)
+	case serviceFreeze, serviceUnFreeze:
+		objectAPI, _ = validateAdminReq(ctx, w, r, policy.ServiceFreezeAdminAction)
+	}
 	if objectAPI == nil {
 		return
 	}
@@ -477,6 +485,8 @@ func (a adminAPIHandlers) ServiceHandler(w http.ResponseWriter, r *http.Request)
 		freezeServices()
 	case serviceUnFreeze:
 		unfreezeServices()
+	case serviceRestart, serviceStop:
+		globalServiceSignalCh <- serviceSig
 	}
 }
 
@@ -524,7 +534,7 @@ func (a adminAPIHandlers) ServiceV2Handler(w http.ResponseWriter, r *http.Reques
 	case madmin.ServiceActionUnfreeze:
 		serviceSig = serviceUnFreeze
 	default:
-		logger.LogIf(ctx, fmt.Errorf("Unrecognized service action %s requested", action), logger.Application)
+		logger.LogIf(ctx, fmt.Errorf("Unrecognized service action %s requested", action), logger.ErrorKind)
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrMalformedPOSTRequest), r.URL)
 		return
 	}
@@ -795,7 +805,7 @@ func (a adminAPIHandlers) MetricsHandler(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// DataUsageInfoHandler - GET /minio/admin/v3/datausage
+// DataUsageInfoHandler - GET /minio/admin/v3/datausage?capacity={true}
 // ----------
 // Get server/cluster data usage info
 func (a adminAPIHandlers) DataUsageInfoHandler(w http.ResponseWriter, r *http.Request) {
@@ -816,6 +826,16 @@ func (a adminAPIHandlers) DataUsageInfoHandler(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
+	}
+
+	// Get capacity info when asked.
+	if r.Form.Get("capacity") == "true" {
+		sinfo := objectAPI.StorageInfo(ctx, false)
+		dataUsageInfo.TotalCapacity = GetTotalUsableCapacity(sinfo.Disks, sinfo)
+		dataUsageInfo.TotalFreeCapacity = GetTotalUsableCapacityFree(sinfo.Disks, sinfo)
+		if dataUsageInfo.TotalCapacity > dataUsageInfo.TotalFreeCapacity {
+			dataUsageInfo.TotalUsedCapacity = dataUsageInfo.TotalCapacity - dataUsageInfo.TotalFreeCapacity
+		}
 	}
 
 	writeSuccessResponseJSON(w, dataUsageInfoJSON)
@@ -1219,7 +1239,7 @@ func extractHealInitParams(vars map[string]string, qParms url.Values, r io.Reade
 	if hip.clientToken == "" {
 		jerr := json.NewDecoder(r).Decode(&hip.hs)
 		if jerr != nil {
-			logger.LogIf(GlobalContext, jerr, logger.Application)
+			logger.LogIf(GlobalContext, jerr, logger.ErrorKind)
 			err = ErrRequestBodyParse
 			return
 		}
@@ -1632,7 +1652,7 @@ func (a adminAPIHandlers) ObjectSpeedTestHandler(w http.ResponseWriter, r *http.
 		duration = time.Second * 10
 	}
 
-	storageInfo := objectAPI.StorageInfo(ctx, true)
+	storageInfo := objectAPI.StorageInfo(ctx, false)
 
 	sufficientCapacity, canAutotune, capacityErrMsg := validateObjPerfOptions(ctx, storageInfo, concurrent, size, autotune)
 	if !sufficientCapacity {
@@ -1909,16 +1929,13 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 	setEventStreamHeaders(w)
 
 	// Trace Publisher and peer-trace-client uses nonblocking send and hence does not wait for slow receivers.
-	// Use buffered channel to take care of burst sends or slow w.Write()
-
-	// Keep 100k buffered channel, should be sufficient to ensure we do not lose any events.
-	traceCh := make(chan madmin.TraceInfo, 100000)
-
+	// Keep 100k buffered channel.
+	// If receiver cannot keep up with that we drop events.
+	traceCh := make(chan []byte, 100000)
 	peers, _ := newPeerRestClients(globalEndpoints)
-
-	err = globalTrace.Subscribe(traceOpts.TraceTypes(), traceCh, ctx.Done(), func(entry madmin.TraceInfo) bool {
+	err = globalTrace.SubscribeJSON(traceOpts.TraceTypes(), traceCh, ctx.Done(), func(entry madmin.TraceInfo) bool {
 		return shouldTrace(entry, traceOpts)
-	})
+	}, nil)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -1933,19 +1950,19 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 		if peer == nil {
 			continue
 		}
-		peer.Trace(traceCh, ctx.Done(), traceOpts)
+		peer.Trace(ctx, traceCh, traceOpts)
 	}
 
 	keepAliveTicker := time.NewTicker(time.Second)
 	defer keepAliveTicker.Stop()
 
-	enc := json.NewEncoder(w)
 	for {
 		select {
 		case entry := <-traceCh:
-			if err := enc.Encode(entry); err != nil {
+			if _, err := w.Write(entry); err != nil {
 				return
 			}
+			grid.PutByteBuffer(entry)
 			if len(traceCh) == 0 {
 				// Flush if nothing is queued
 				w.(http.Flusher).Flush()
@@ -2184,7 +2201,10 @@ func getPoolsInfo(ctx context.Context, allDisks []madmin.Disk) (map[int]map[int]
 		return nil, errServerNotInitialized
 	}
 
-	z, _ := objectAPI.(*erasureServerPools)
+	z, ok := objectAPI.(*erasureServerPools)
+	if !ok {
+		return nil, errServerNotInitialized
+	}
 
 	poolsInfo := make(map[int]map[int]madmin.ErasureSetInfo)
 	for _, d := range allDisks {
@@ -2215,7 +2235,7 @@ func getPoolsInfo(ctx context.Context, allDisks []madmin.Disk) (map[int]map[int]
 	return poolsInfo, nil
 }
 
-func getServerInfo(ctx context.Context, poolsInfoEnabled bool, r *http.Request) madmin.InfoMessage {
+func getServerInfo(ctx context.Context, pools, metrics bool, r *http.Request) madmin.InfoMessage {
 	ldap := madmin.LDAP{}
 	if globalIAMSys.LDAPConfig.Enabled() {
 		ldapConn, err := globalIAMSys.LDAPConfig.LDAP.Connect()
@@ -2236,8 +2256,8 @@ func getServerInfo(ctx context.Context, poolsInfoEnabled bool, r *http.Request) 
 	// Get the notification target info
 	notifyTarget := fetchLambdaInfo()
 
-	local := getLocalServerProperty(globalEndpoints, r)
-	servers := globalNotificationSys.ServerInfo()
+	local := getLocalServerProperty(globalEndpoints, r, metrics)
+	servers := globalNotificationSys.ServerInfo(metrics)
 	servers = append(servers, local)
 
 	assignPoolNumbers(servers)
@@ -2291,7 +2311,7 @@ func getServerInfo(ctx context.Context, poolsInfoEnabled bool, r *http.Request) 
 			DrivesPerSet:     backendInfo.DrivesPerSet,
 		}
 
-		if poolsInfoEnabled {
+		if pools {
 			poolsInfo, _ = getPoolsInfo(ctx, allDisks)
 		}
 	}
@@ -2673,7 +2693,7 @@ func fetchHealthInfo(healthCtx context.Context, objectAPI ObjectLayer, query *ur
 		getAndWriteSysConfig()
 
 		if query.Get("minioinfo") == "true" {
-			infoMessage := getServerInfo(healthCtx, false, nil)
+			infoMessage := getServerInfo(healthCtx, false, true, nil)
 			servers := make([]madmin.ServerInfo, 0, len(infoMessage.Servers))
 			for _, server := range infoMessage.Servers {
 				anonEndpoint := anonAddr(server.Endpoint)
@@ -2861,8 +2881,10 @@ func (a adminAPIHandlers) ServerInfoHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	metrics := r.Form.Get(peerRESTMetrics) == "true"
+
 	// Marshal API response
-	jsonBytes, err := json.Marshal(getServerInfo(ctx, true, r))
+	jsonBytes, err := json.Marshal(getServerInfo(ctx, true, metrics, r))
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -3053,7 +3075,7 @@ func getClusterMetaInfo(ctx context.Context) []byte {
 		ci.Info.NoOfServers = totalNodeCount()
 		ci.Info.MinioVersion = Version
 
-		si := objectAPI.StorageInfo(ctx, true)
+		si := objectAPI.StorageInfo(ctx, false)
 
 		ci.Info.NoOfDrives = len(si.Disks)
 		for _, disk := range si.Disks {

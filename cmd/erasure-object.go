@@ -46,7 +46,6 @@ import (
 	"github.com/minio/pkg/v2/mimedb"
 	"github.com/minio/pkg/v2/sync/errgroup"
 	"github.com/minio/pkg/v2/wildcard"
-	"github.com/tinylib/msgp/msgp"
 )
 
 // list all errors which can be ignored in object operations.
@@ -91,7 +90,7 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 
 	// Read metadata associated with the object from all disks.
 	if srcOpts.VersionID != "" {
-		metaArr, errs = readAllFileInfo(ctx, storageDisks, srcBucket, srcObject, srcOpts.VersionID, true, false)
+		metaArr, errs = readAllFileInfo(ctx, storageDisks, "", srcBucket, srcObject, srcOpts.VersionID, true, false)
 	} else {
 		metaArr, errs = readAllXL(ctx, storageDisks, srcBucket, srcObject, true, false, true)
 	}
@@ -179,7 +178,7 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	}
 
 	// Write unique `xl.meta` for each disk.
-	if _, err = writeUniqueFileInfo(ctx, onlineDisks, srcBucket, srcObject, metaArr, writeQuorum); err != nil {
+	if _, err = writeUniqueFileInfo(ctx, onlineDisks, "", srcBucket, srcObject, metaArr, writeQuorum); err != nil {
 		return oi, toObjectErr(err, srcBucket, srcObject)
 	}
 
@@ -546,29 +545,6 @@ func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object st
 	return m, err
 }
 
-var readRawFileInfoErrs = append(objectOpIgnoredErrs,
-	errFileNotFound,
-	errFileNameTooLong,
-	errVolumeNotFound,
-	errFileVersionNotFound,
-	io.ErrUnexpectedEOF, // some times we would read without locks, ignore these errors
-	io.EOF,              // some times we would read without locks, ignore these errors
-	msgp.ErrShortBytes,
-	context.DeadlineExceeded,
-	context.Canceled,
-)
-
-func readRawFileInfo(ctx context.Context, disk StorageAPI, bucket, object string, readData bool) (RawFileInfo, error) {
-	rf, err := disk.ReadXL(ctx, bucket, object, readData)
-
-	if err != nil && !IsErr(err, readRawFileInfoErrs...) {
-		logger.LogOnceIf(ctx, fmt.Errorf("Drive %s, path (%s/%s) returned an error (%w)",
-			disk.String(), bucket, object, err),
-			disk.String())
-	}
-	return rf, err
-}
-
 func fileInfoFromRaw(ri RawFileInfo, bucket, object string, readData, inclFreeVers, allParts bool) (FileInfo, error) {
 	var xl xlMetaV2
 	if err := xl.LoadOrConvert(ri.Buf); err != nil {
@@ -598,7 +574,6 @@ func fileInfoFromRaw(ri RawFileInfo, bucket, object string, readData, inclFreeVe
 		fileInfo.Data = xl.data.find(versionID)
 	}
 
-	fileInfo.DiskMTime = ri.DiskMTime
 	return fileInfo, nil
 }
 
@@ -611,7 +586,7 @@ func readAllRawFileInfo(ctx context.Context, disks []StorageAPI, bucket, object 
 			if disks[index] == nil {
 				return errDiskNotFound
 			}
-			rf, err := readRawFileInfo(ctx, disks[index], bucket, object, readData)
+			rf, err := disks[index].ReadXL(ctx, bucket, object, readData)
 			if err != nil {
 				return err
 			}
@@ -649,9 +624,7 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 			continue
 		}
 		metadataArray[index] = &xl
-		metaFileInfos[index] = FileInfo{
-			DiskMTime: rf.DiskMTime,
-		}
+		metaFileInfos[index] = FileInfo{}
 	}
 
 	for index := range metadataArray {
@@ -691,7 +664,6 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 		}
 
 		// make sure to preserve this for diskmtime based healing bugfix.
-		diskMTime := metaFileInfos[index].DiskMTime
 		metaFileInfos[index], errs[index] = metadataArray[index].ToFileInfo(bucket, object, versionID, inclFreeVers, allParts)
 		if errs[index] != nil {
 			continue
@@ -700,7 +672,6 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 		if readData {
 			metaFileInfos[index].Data = metadataArray[index].data.find(versionID)
 		}
-		metaFileInfos[index].DiskMTime = diskMTime
 	}
 	if !readData {
 		for i := range v2bufs {
@@ -791,10 +762,10 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 
 				if opts.VersionID != "" {
 					// Read a specific version ID
-					fi, err = readFileInfo(ctx, disk, bucket, object, opts.VersionID, ropts)
+					fi, err = disk.ReadVersion(ctx, "", bucket, object, opts.VersionID, ropts)
 				} else {
 					// Read the latest version
-					rfi, err = readRawFileInfo(ctx, disk, bucket, object, readData)
+					rfi, err = disk.ReadXL(ctx, bucket, object, readData)
 					if err == nil {
 						fi, err = fileInfoFromRaw(rfi, bucket, object, readData, opts.InclFreeVersions, true)
 					}
@@ -829,7 +800,11 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 
 		var missingBlocks int
 		for i := range errs {
-			if errors.Is(errs[i], errFileNotFound) {
+			if IsErr(errs[i],
+				errFileNotFound,
+				errFileVersionNotFound,
+				errFileCorrupt,
+			) {
 				missingBlocks++
 			}
 		}
@@ -1114,7 +1089,7 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 
 	// Validate input data size and it can never be less than zero.
 	if data.Size() < -1 {
-		logger.LogIf(ctx, errInvalidArgument, logger.Application)
+		logger.LogIf(ctx, errInvalidArgument, logger.ErrorKind)
 		return ObjectInfo{}, toObjectErr(errInvalidArgument)
 	}
 
@@ -1219,7 +1194,7 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 		}
 	}
 
-	if _, err = writeUniqueFileInfo(ctx, onlineDisks, minioMetaBucket, key, partsMetadata, writeQuorum); err != nil {
+	if _, err = writeUniqueFileInfo(ctx, onlineDisks, "", minioMetaBucket, key, partsMetadata, writeQuorum); err != nil {
 		return ObjectInfo{}, toObjectErr(err, minioMetaBucket, key)
 	}
 
@@ -1301,7 +1276,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 
 	// Validate input data size and it can never be less than -1.
 	if data.Size() < -1 {
-		logger.LogIf(ctx, errInvalidArgument, logger.Application)
+		logger.LogIf(ctx, errInvalidArgument, logger.ErrorKind)
 		return ObjectInfo{}, toObjectErr(errInvalidArgument)
 	}
 
@@ -1449,7 +1424,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 			continue
 		}
 
-		writers[i] = newBitrotWriter(disk, minioMetaTmpBucket, tempErasureObj, shardFileSize, DefaultBitrotAlgorithm, erasure.ShardSize())
+		writers[i] = newBitrotWriter(disk, bucket, minioMetaTmpBucket, tempErasureObj, shardFileSize, DefaultBitrotAlgorithm, erasure.ShardSize())
 	}
 
 	toEncode := io.Reader(data)
@@ -1469,7 +1444,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	n, erasureErr := erasure.Encode(ctx, toEncode, writers, buffer, writeQuorum)
 	closeBitrotWriters(writers)
 	if erasureErr != nil {
-		return ObjectInfo{}, toObjectErr(erasureErr, minioMetaTmpBucket, tempErasureObj)
+		return ObjectInfo{}, toObjectErr(erasureErr, bucket, object)
 	}
 
 	// Should return IncompleteBody{} error when reader has fewer bytes
@@ -1536,12 +1511,11 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		partsMetadata[index].Metadata = userDefined
 		partsMetadata[index].Size = n
 		partsMetadata[index].ModTime = modTime
-	}
-
-	if len(inlineBuffers) > 0 {
-		// Set an additional header when data is inlined.
-		for index := range partsMetadata {
+		if len(inlineBuffers) > 0 {
 			partsMetadata[index].SetInlineData()
+		}
+		if opts.DataMovement {
+			partsMetadata[index].SetDataMov()
 		}
 	}
 
@@ -2057,7 +2031,7 @@ func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object s
 
 	// Read metadata associated with the object from all disks.
 	if opts.VersionID != "" {
-		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false, false)
+		metaArr, errs = readAllFileInfo(ctx, disks, "", bucket, object, opts.VersionID, false, false)
 	} else {
 		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false, true)
 	}
@@ -2130,7 +2104,7 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 
 	// Read metadata associated with the object from all disks.
 	if opts.VersionID != "" {
-		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false, false)
+		metaArr, errs = readAllFileInfo(ctx, disks, "", bucket, object, opts.VersionID, false, false)
 	} else {
 		metaArr, errs = readAllXL(ctx, disks, bucket, object, false, false, true)
 	}
@@ -2197,7 +2171,7 @@ func (er erasureObjects) updateObjectMetaWithOpts(ctx context.Context, bucket, o
 	// Wait for all the routines.
 	mErrs := g.Wait()
 
-	return reduceWriteQuorumErrs(ctx, mErrs, objectOpIgnoredErrs, er.defaultWQuorum())
+	return reduceWriteQuorumErrs(ctx, mErrs, objectOpIgnoredErrs, fi.WriteQuorum(er.defaultWQuorum()))
 }
 
 // updateObjectMeta will update the metadata of a file.
@@ -2458,7 +2432,7 @@ func (er erasureObjects) DecomTieredObject(ctx context.Context, bucket, object s
 	var onlineDisks []StorageAPI
 	onlineDisks, partsMetadata = shuffleDisksAndPartsMetadata(storageDisks, partsMetadata, fi)
 
-	if _, err := writeUniqueFileInfo(ctx, onlineDisks, bucket, object, partsMetadata, writeQuorum); err != nil {
+	if _, err := writeUniqueFileInfo(ctx, onlineDisks, "", bucket, object, partsMetadata, writeQuorum); err != nil {
 		return toObjectErr(err, bucket, object)
 	}
 

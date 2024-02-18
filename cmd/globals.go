@@ -34,6 +34,7 @@ import (
 	"github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/browser"
+	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
 	"go.uber.org/atomic"
@@ -130,6 +131,11 @@ const (
 	tlsClientSessionCacheSize = 100
 )
 
+func init() {
+	// Injected to prevent circular dependency.
+	pubsub.GetByteBuffer = grid.GetByteBuffer
+}
+
 type poolDisksLayout struct {
 	cmdline string
 	layout  [][]string
@@ -154,9 +160,10 @@ type serverCtxt struct {
 	FTP  []string
 	SFTP []string
 
-	UserTimeout       time.Duration
-	ConnReadDeadline  time.Duration
-	ConnWriteDeadline time.Duration
+	UserTimeout            time.Duration
+	ConnReadDeadline       time.Duration
+	ConnWriteDeadline      time.Duration
+	ConnClientReadDeadline time.Duration
 
 	ShutdownTimeout     time.Duration
 	IdleTimeout         time.Duration
@@ -412,7 +419,7 @@ var (
 	globalServiceFreezeMu  sync.Mutex // Updates.
 
 	// List of local drives to this node, this is only set during server startup,
-	// and should never be mutated. Hold globalLocalDrivesMu to access.
+	// and is only mutated by HealFormat. Hold globalLocalDrivesMu to access.
 	globalLocalDrives   []StorageAPI
 	globalLocalDrivesMu sync.RWMutex
 

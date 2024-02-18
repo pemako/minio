@@ -30,7 +30,7 @@ import (
 )
 
 // ErrDisconnected is returned when the connection to the remote has been lost during the call.
-var ErrDisconnected = errors.New("remote disconnected")
+var ErrDisconnected = RemoteErr("remote disconnected")
 
 const (
 	// minBufferSize is the minimum buffer size.
@@ -45,7 +45,7 @@ const (
 	maxBufferSize = 64 << 10
 
 	// If there is a queue, merge up to this many messages.
-	maxMergeMessages = 20
+	maxMergeMessages = 30
 
 	// clientPingInterval will ping the remote handler every 15 seconds.
 	// Clients disconnect when we exceed 2 intervals.

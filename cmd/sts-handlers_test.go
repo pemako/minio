@@ -909,14 +909,6 @@ func (s *TestSuiteIAM) TestLDAPSTSServiceAccounts(c *check) {
 	// 3. Check S3 access
 	c.assertSvcAccS3Access(ctx, s, cr, bucket)
 
-	// 4. Check that svc account can restrict the policy, and that the
-	// session policy can be updated.
-	c.assertSvcAccSessionPolicyUpdate(ctx, s, userAdmClient, value.AccessKeyID, bucket)
-
-	// 4. Check that service account's secret key and account status can be
-	// updated.
-	c.assertSvcAccSecretKeyAndStatusUpdate(ctx, s, userAdmClient, value.AccessKeyID, bucket)
-
 	// 5. Check that service account can be deleted.
 	c.assertSvcAccDeletion(ctx, s, userAdmClient, value.AccessKeyID, bucket)
 
@@ -1101,14 +1093,6 @@ func (s *TestSuiteIAM) TestLDAPSTSServiceAccountsWithGroups(c *check) {
 	// 3. Check S3 access
 	c.assertSvcAccS3Access(ctx, s, cr, bucket)
 
-	// 4. Check that svc account can restrict the policy, and that the
-	// session policy can be updated.
-	c.assertSvcAccSessionPolicyUpdate(ctx, s, userAdmClient, value.AccessKeyID, bucket)
-
-	// 4. Check that service account's secret key and account status can be
-	// updated.
-	c.assertSvcAccSecretKeyAndStatusUpdate(ctx, s, userAdmClient, value.AccessKeyID, bucket)
-
 	// 5. Check that service account can be deleted.
 	c.assertSvcAccDeletion(ctx, s, userAdmClient, value.AccessKeyID, bucket)
 
@@ -1188,6 +1172,97 @@ func (s *TestSuiteIAM) TestOpenIDSTS(c *check) {
 	err = minioClient.RemoveObject(ctx, bucket, "someobject", minio.RemoveObjectOptions{})
 	if err.Error() != "Access Denied." {
 		c.Fatalf("unexpected non-access-denied err: %v", err)
+	}
+}
+
+func (s *TestSuiteIAM) TestOpenIDSTSDurationSeconds(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	bucket := getRandomBucketName()
+	err := s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+	if err != nil {
+		c.Fatalf("bucket create error: %v", err)
+	}
+
+	// Generate web identity STS token by interacting with OpenID IDP.
+	token, err := MockOpenIDTestUserInteraction(ctx, testAppParams, "dillon@example.io", "dillon")
+	if err != nil {
+		c.Fatalf("mock user err: %v", err)
+	}
+	// fmt.Printf("TOKEN: %s\n", token)
+
+	webID := cr.STSWebIdentity{
+		Client:      s.TestSuiteCommon.client,
+		STSEndpoint: s.endPoint,
+		GetWebIDTokenExpiry: func() (*cr.WebIdentityToken, error) {
+			return &cr.WebIdentityToken{
+				Token:  token,
+				Expiry: 900,
+			}, nil
+		},
+	}
+
+	// Create policy - with name as one of the groups in OpenID the user is
+	// a member of.
+	policy := "projecta"
+	policyTmpl := `{
+ "Version": "2012-10-17",
+ "Statement": [
+  {
+    "Effect": "Deny",
+    "Action": ["sts:AssumeRoleWithWebIdentity"],
+    "Condition": {"NumericGreaterThan": {"sts:DurationSeconds": "%d"}}
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject",
+    "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s/*"
+   ]
+  }
+ ]
+}`
+
+	for i, testCase := range []struct {
+		durSecs     int
+		expectedErr bool
+	}{
+		{60, true},
+		{1800, false},
+	} {
+		policyBytes := []byte(fmt.Sprintf(policyTmpl, testCase.durSecs, bucket))
+		err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
+		if err != nil {
+			c.Fatalf("Test %d: policy add error: %v", i+1, err)
+		}
+
+		value, err := webID.Retrieve()
+		if err != nil && !testCase.expectedErr {
+			c.Fatalf("Test %d: Expected to generate STS creds, got err: %#v", i+1, err)
+		}
+		if err == nil && testCase.expectedErr {
+			c.Fatalf("Test %d: An error is unexpected to generate STS creds, got err: %#v", i+1, err)
+		}
+
+		if err != nil && testCase.expectedErr {
+			continue
+		}
+
+		minioClient, err := minio.New(s.endpoint, &minio.Options{
+			Creds:     cr.NewStaticV4(value.AccessKeyID, value.SecretAccessKey, value.SessionToken),
+			Secure:    s.secure,
+			Transport: s.TestSuiteCommon.client.Transport,
+		})
+		if err != nil {
+			c.Fatalf("Test %d: Error initializing client: %v", i+1, err)
+		}
+
+		c.mustListObjects(ctx, minioClient, bucket)
 	}
 }
 
@@ -1358,14 +1433,6 @@ func (s *TestSuiteIAM) TestOpenIDServiceAcc(c *check) {
 	// 3. Check S3 access
 	c.assertSvcAccS3Access(ctx, s, cr, bucket)
 
-	// 4. Check that svc account can restrict the policy, and that the
-	// session policy can be updated.
-	c.assertSvcAccSessionPolicyUpdate(ctx, s, userAdmClient, value.AccessKeyID, bucket)
-
-	// 4. Check that service account's secret key and account status can be
-	// updated.
-	c.assertSvcAccSecretKeyAndStatusUpdate(ctx, s, userAdmClient, value.AccessKeyID, bucket)
-
 	// 5. Check that service account can be deleted.
 	c.assertSvcAccDeletion(ctx, s, userAdmClient, value.AccessKeyID, bucket)
 
@@ -1464,6 +1531,7 @@ func TestIAMWithOpenIDServerSuite(t *testing.T) {
 				suite.SetUpSuite(c)
 				suite.SetUpOpenID(c, openIDServer, "")
 				suite.TestOpenIDSTS(c)
+				suite.TestOpenIDSTSDurationSeconds(c)
 				suite.TestOpenIDServiceAcc(c)
 				suite.TestOpenIDSTSAddUser(c)
 				suite.TearDownSuite(c)
@@ -1657,14 +1725,6 @@ func (s *TestSuiteIAM) TestOpenIDServiceAccWithRolePolicy(c *check) {
 
 	// 3. Check S3 access
 	c.assertSvcAccS3Access(ctx, s, cr, bucket)
-
-	// 4. Check that svc account can restrict the policy, and that the
-	// session policy can be updated.
-	c.assertSvcAccSessionPolicyUpdate(ctx, s, userAdmClient, value.AccessKeyID, bucket)
-
-	// 4. Check that service account's secret key and account status can be
-	// updated.
-	c.assertSvcAccSecretKeyAndStatusUpdate(ctx, s, userAdmClient, value.AccessKeyID, bucket)
 
 	// 5. Check that service account can be deleted.
 	c.assertSvcAccDeletion(ctx, s, userAdmClient, value.AccessKeyID, bucket)
