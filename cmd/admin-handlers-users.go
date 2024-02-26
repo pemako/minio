@@ -1072,6 +1072,10 @@ func (a adminAPIHandlers) DeleteServiceAccount(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	if serviceAccount == siteReplicatorSvcAcc && globalSiteReplicationSys.isEnabled() {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidArgument), r.URL)
+		return
+	}
 	// We do not care if service account is readable or not at this point,
 	// since this is a delete call we shall allow it to be deleted if possible.
 	svcAccount, _, err := globalIAMSys.GetServiceAccount(ctx, serviceAccount)
@@ -1200,7 +1204,7 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 
 		// Rely on older value if usage loading fails from disk.
 		bucketStorageCache.Relax = true
-		bucketStorageCache.Update = func() (interface{}, error) {
+		bucketStorageCache.Update = func() (DataUsageInfo, error) {
 			ctx, done := context.WithTimeout(context.Background(), 2*time.Second)
 			defer done()
 
@@ -1208,11 +1212,7 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 		}
 	})
 
-	var dataUsageInfo DataUsageInfo
-	v, _ := bucketStorageCache.Get()
-	if v != nil {
-		dataUsageInfo, _ = v.(DataUsageInfo)
-	}
+	dataUsageInfo, _ := bucketStorageCache.Get()
 
 	// If etcd, dns federation configured list buckets from etcd.
 	var err error

@@ -1192,7 +1192,7 @@ type healInitParams struct {
 }
 
 // extractHealInitParams - Validates params for heal init API.
-func extractHealInitParams(vars map[string]string, qParms url.Values, r io.Reader) (hip healInitParams, err APIErrorCode) {
+func extractHealInitParams(vars map[string]string, qParams url.Values, r io.Reader) (hip healInitParams, err APIErrorCode) {
 	hip.bucket = vars[mgmtBucket]
 	hip.objPrefix = vars[mgmtPrefix]
 
@@ -1213,13 +1213,13 @@ func extractHealInitParams(vars map[string]string, qParms url.Values, r io.Reade
 		return
 	}
 
-	if len(qParms[mgmtClientToken]) > 0 {
-		hip.clientToken = qParms[mgmtClientToken][0]
+	if len(qParams[mgmtClientToken]) > 0 {
+		hip.clientToken = qParams[mgmtClientToken][0]
 	}
-	if _, ok := qParms[mgmtForceStart]; ok {
+	if _, ok := qParams[mgmtForceStart]; ok {
 		hip.forceStart = true
 	}
-	if _, ok := qParms[mgmtForceStop]; ok {
+	if _, ok := qParams[mgmtForceStop]; ok {
 		hip.forceStop = true
 	}
 
@@ -1984,7 +1984,6 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 // The ConsoleLogHandler handler sends console logs to the connected HTTP client.
 func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ConsoleLogAdminAction)
 	if objectAPI == nil {
 		return
@@ -2009,44 +2008,65 @@ func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Reque
 
 	setEventStreamHeaders(w)
 
-	logCh := make(chan log.Info, 4000)
-
+	logCh := make(chan log.Info, 1000)
 	peers, _ := newPeerRestClients(globalEndpoints)
-
+	encodedCh := make(chan []byte, 1000+len(peers)*1000)
 	err = globalConsoleSys.Subscribe(logCh, ctx.Done(), node, limitLines, logKind, nil)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
+	// Convert local entries to JSON
+	go func() {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case li := <-logCh:
+				if !li.SendLog(node, logKind) {
+					continue
+				}
+				buf.Reset()
+				if err := enc.Encode(li); err != nil {
+					continue
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case encodedCh <- append(grid.GetByteBuffer()[:0], buf.Bytes()...):
+				}
+			}
+		}
+	}()
 
+	// Collect from matching peers
 	for _, peer := range peers {
 		if peer == nil {
 			continue
 		}
 		if node == "" || strings.EqualFold(peer.host.Name, node) {
-			peer.ConsoleLog(logCh, ctx.Done())
+			peer.ConsoleLog(ctx, logKind, encodedCh)
 		}
 	}
 
-	enc := json.NewEncoder(w)
-
 	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
 	defer keepAliveTicker.Stop()
-
 	for {
 		select {
-		case log, ok := <-logCh:
+		case log, ok := <-encodedCh:
 			if !ok {
 				return
 			}
-			if log.SendLog(node, logKind) {
-				if err := enc.Encode(log); err != nil {
-					return
-				}
-				if len(logCh) == 0 {
-					// Flush if nothing is queued
-					w.(http.Flusher).Flush()
-				}
+			_, err = w.Write(log)
+			if err != nil {
+				return
+			}
+			grid.PutByteBuffer(log)
+			if len(logCh) == 0 {
+				// Flush if nothing is queued
+				w.(http.Flusher).Flush()
 			}
 		case <-keepAliveTicker.C:
 			if len(logCh) > 0 {

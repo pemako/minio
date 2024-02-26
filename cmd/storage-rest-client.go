@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/cachevalue"
 	"github.com/minio/minio/internal/grid"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
@@ -166,6 +167,8 @@ type storageRESTClient struct {
 	formatData  []byte
 	formatMutex sync.RWMutex
 
+	diskInfoCache *cachevalue.Cache[DiskInfo]
+
 	// Indexes, will be -1 until assigned a set.
 	poolIndex, setIndex, diskIndex int
 }
@@ -237,7 +240,7 @@ func (client *storageRESTClient) NSScanner(ctx context.Context, cache dataUsageC
 	defer atomic.AddInt32(&client.scanning, -1)
 	defer xioutil.SafeClose(updates)
 
-	st, err := storageNSScannerHandler.Call(ctx, client.gridConn, &nsScannerOptions{
+	st, err := storageNSScannerRPC.Call(ctx, client.gridConn, &nsScannerOptions{
 		DiskID:   client.diskID,
 		ScanMode: int(scanMode),
 		Cache:    &cache,
@@ -306,21 +309,48 @@ func (client *storageRESTClient) DiskInfo(ctx context.Context, opts DiskInfoOpti
 		// transport is already down.
 		return info, errDiskNotFound
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 
-	opts.DiskID = client.diskID
+	// if metrics was asked, or it was a NoOp we do not need to cache the value.
+	if opts.Metrics || opts.NoOp {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
 
-	infop, err := storageDiskInfoHandler.Call(ctx, client.gridConn, &opts)
-	if err != nil {
-		return info, toStorageErr(err)
-	}
-	info = *infop
-	if info.Error != "" {
-		return info, toStorageErr(errors.New(info.Error))
-	}
+		opts.DiskID = client.diskID
+
+		infop, err := storageDiskInfoRPC.Call(ctx, client.gridConn, &opts)
+		if err != nil {
+			return info, toStorageErr(err)
+		}
+		info = *infop
+		if info.Error != "" {
+			return info, toStorageErr(errors.New(info.Error))
+		}
+		info.Scanning = atomic.LoadInt32(&client.scanning) == 1
+		return info, nil
+	} // In all other cases cache the value upto 1sec.
+
+	client.diskInfoCache.Once.Do(func() {
+		client.diskInfoCache.TTL = time.Second
+		client.diskInfoCache.Update = func() (info DiskInfo, err error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			nopts := DiskInfoOptions{DiskID: client.diskID}
+			infop, err := storageDiskInfoRPC.Call(ctx, client.gridConn, &nopts)
+			if err != nil {
+				return info, toStorageErr(err)
+			}
+			info = *infop
+			if info.Error != "" {
+				return info, toStorageErr(errors.New(info.Error))
+			}
+			return info, nil
+		}
+	})
+
+	info, err = client.diskInfoCache.Get()
 	info.Scanning = atomic.LoadInt32(&client.scanning) == 1
-	return info, nil
+	return info, err
 }
 
 // MakeVolBulk - create multiple volumes in a bulk operation.
@@ -340,7 +370,7 @@ func (client *storageRESTClient) ListVols(ctx context.Context) (vols []VolInfo, 
 
 // StatVol - get volume info over the network.
 func (client *storageRESTClient) StatVol(ctx context.Context, volume string) (vol VolInfo, err error) {
-	v, err := storageStatVolHandler.Call(ctx, client.gridConn, grid.NewMSSWith(map[string]string{
+	v, err := storageStatVolRPC.Call(ctx, client.gridConn, grid.NewMSSWith(map[string]string{
 		storageRESTDiskID: client.diskID,
 		storageRESTVolume: volume,
 	}))
@@ -349,7 +379,7 @@ func (client *storageRESTClient) StatVol(ctx context.Context, volume string) (vo
 	}
 	vol = *v
 	// Performs shallow copy, so we can reuse.
-	storageStatVolHandler.PutResponse(v)
+	storageStatVolRPC.PutResponse(v)
 	return vol, nil
 }
 
@@ -386,7 +416,7 @@ func (client *storageRESTClient) CreateFile(ctx context.Context, origvolume, vol
 }
 
 func (client *storageRESTClient) WriteMetadata(ctx context.Context, origvolume, volume, path string, fi FileInfo) error {
-	_, err := storageWriteMetadataHandler.Call(ctx, client.gridConn, &MetadataHandlerParams{
+	_, err := storageWriteMetadataRPC.Call(ctx, client.gridConn, &MetadataHandlerParams{
 		DiskID:     client.diskID,
 		OrigVolume: origvolume,
 		Volume:     volume,
@@ -397,7 +427,7 @@ func (client *storageRESTClient) WriteMetadata(ctx context.Context, origvolume, 
 }
 
 func (client *storageRESTClient) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo, opts UpdateMetadataOpts) error {
-	_, err := storageUpdateMetadataHandler.Call(ctx, client.gridConn, &MetadataHandlerParams{
+	_, err := storageUpdateMetadataRPC.Call(ctx, client.gridConn, &MetadataHandlerParams{
 		DiskID:     client.diskID,
 		Volume:     volume,
 		FilePath:   path,
@@ -408,7 +438,7 @@ func (client *storageRESTClient) UpdateMetadata(ctx context.Context, volume, pat
 }
 
 func (client *storageRESTClient) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool, opts DeleteOptions) (err error) {
-	_, err = storageDeleteVersionHandler.Call(ctx, client.gridConn, &DeleteVersionHandlerParams{
+	_, err = storageDeleteVersionRPC.Call(ctx, client.gridConn, &DeleteVersionHandlerParams{
 		DiskID:         client.diskID,
 		Volume:         volume,
 		FilePath:       path,
@@ -431,7 +461,7 @@ func (client *storageRESTClient) WriteAll(ctx context.Context, volume string, pa
 
 // CheckParts - stat all file parts.
 func (client *storageRESTClient) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) error {
-	_, err := storageCheckPartsHandler.Call(ctx, client.gridConn, &CheckPartsHandlerParams{
+	_, err := storageCheckPartsRPC.Call(ctx, client.gridConn, &CheckPartsHandlerParams{
 		DiskID:   client.diskID,
 		Volume:   volume,
 		FilePath: path,
@@ -442,7 +472,7 @@ func (client *storageRESTClient) CheckParts(ctx context.Context, volume string, 
 
 // RenameData - rename source path to destination path atomically, metadata and data file.
 func (client *storageRESTClient) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (sign uint64, err error) {
-	resp, err := storageRenameDataHandler.Call(ctx, client.gridConn, &RenameDataHandlerParams{
+	resp, err := storageRenameDataRPC.Call(ctx, client.gridConn, &RenameDataHandlerParams{
 		DiskID:    client.diskID,
 		SrcVolume: srcVolume,
 		SrcPath:   srcPath,
@@ -454,7 +484,7 @@ func (client *storageRESTClient) RenameData(ctx context.Context, srcVolume, srcP
 	if err != nil {
 		return 0, toStorageErr(err)
 	}
-	defer storageRenameDataHandler.PutResponse(resp)
+	defer storageRenameDataRPC.PutResponse(resp)
 	return resp.Signature, nil
 }
 
@@ -484,7 +514,7 @@ func readMsgpReaderPoolPut(r *msgp.Reader) {
 func (client *storageRESTClient) ReadVersion(ctx context.Context, origvolume, volume, path, versionID string, opts ReadOptions) (fi FileInfo, err error) {
 	// Use websocket when not reading data.
 	if !opts.ReadData {
-		resp, err := storageReadVersionHandler.Call(ctx, client.gridConn, grid.NewMSSWith(map[string]string{
+		resp, err := storageReadVersionRPC.Call(ctx, client.gridConn, grid.NewMSSWith(map[string]string{
 			storageRESTDiskID:     client.diskID,
 			storageRESTOrigVolume: origvolume,
 			storageRESTVolume:     volume,
@@ -524,7 +554,7 @@ func (client *storageRESTClient) ReadVersion(ctx context.Context, origvolume, vo
 func (client *storageRESTClient) ReadXL(ctx context.Context, volume string, path string, readData bool) (rf RawFileInfo, err error) {
 	// Use websocket when not reading data.
 	if !readData {
-		resp, err := storageReadXLHandler.Call(ctx, client.gridConn, grid.NewMSSWith(map[string]string{
+		resp, err := storageReadXLRPC.Call(ctx, client.gridConn, grid.NewMSSWith(map[string]string{
 			storageRESTDiskID:   client.diskID,
 			storageRESTVolume:   volume,
 			storageRESTFilePath: path,
@@ -567,7 +597,7 @@ func (client *storageRESTClient) ReadAll(ctx context.Context, volume string, pat
 		}
 	}
 
-	gridBytes, err := storageReadAllHandler.Call(ctx, client.gridConn, &ReadAllHandlerParams{
+	gridBytes, err := storageReadAllRPC.Call(ctx, client.gridConn, &ReadAllHandlerParams{
 		DiskID:   client.diskID,
 		Volume:   volume,
 		FilePath: path,
@@ -618,24 +648,27 @@ func (client *storageRESTClient) ReadFile(ctx context.Context, volume string, pa
 
 // ListDir - lists a directory.
 func (client *storageRESTClient) ListDir(ctx context.Context, origvolume, volume, dirPath string, count int) (entries []string, err error) {
-	values := make(url.Values)
+	values := grid.NewMSS()
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTDirPath, dirPath)
 	values.Set(storageRESTCount, strconv.Itoa(count))
 	values.Set(storageRESTOrigVolume, origvolume)
+	values.Set(storageRESTDiskID, client.diskID)
 
-	respBody, err := client.call(ctx, storageRESTMethodListDir, values, nil, -1)
+	st, err := storageListDirRPC.Call(ctx, client.gridConn, values)
 	if err != nil {
-		return nil, err
+		return nil, toStorageErr(err)
 	}
-	defer xhttp.DrainBody(respBody)
-	err = gob.NewDecoder(respBody).Decode(&entries)
-	return entries, err
+	err = st.Results(func(resp *ListDirResult) error {
+		entries = resp.Entries
+		return nil
+	})
+	return entries, toStorageErr(err)
 }
 
 // DeleteFile - deletes a file.
 func (client *storageRESTClient) Delete(ctx context.Context, volume string, path string, deleteOpts DeleteOptions) error {
-	_, err := storageDeleteFileHandler.Call(ctx, client.gridConn, &DeleteFileHandlerParams{
+	_, err := storageDeleteFileRPC.Call(ctx, client.gridConn, &DeleteFileHandlerParams{
 		DiskID:   client.diskID,
 		Volume:   volume,
 		FilePath: path,
@@ -700,7 +733,7 @@ func (client *storageRESTClient) DeleteVersions(ctx context.Context, volume stri
 
 // RenameFile - renames a file.
 func (client *storageRESTClient) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) (err error) {
-	_, err = storageRenameFileHandler.Call(ctx, client.gridConn, &RenameFileHandlerParams{
+	_, err = storageRenameFileRPC.Call(ctx, client.gridConn, &RenameFileHandlerParams{
 		DiskID:      client.diskID,
 		SrcVolume:   srcVolume,
 		SrcFilePath: srcPath,
@@ -860,6 +893,7 @@ func newStorageRESTClient(endpoint Endpoint, healthCheck bool, gm *grid.Manager)
 	}
 	return &storageRESTClient{
 		endpoint: endpoint, restClient: restClient, poolIndex: -1, setIndex: -1, diskIndex: -1,
-		gridConn: conn,
+		gridConn:      conn,
+		diskInfoCache: cachevalue.New[DiskInfo](),
 	}, nil
 }
