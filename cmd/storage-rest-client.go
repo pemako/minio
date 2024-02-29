@@ -31,7 +31,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
@@ -157,9 +156,6 @@ func toStorageErr(err error) error {
 
 // Abstracts a remote disk.
 type storageRESTClient struct {
-	// Indicate of NSScanner is in progress in this disk
-	scanning int32
-
 	endpoint    Endpoint
 	restClient  *rest.Client
 	gridConn    *grid.Subroute
@@ -209,7 +205,7 @@ func (client *storageRESTClient) String() string {
 
 // IsOnline - returns whether RPC client failed to connect or not.
 func (client *storageRESTClient) IsOnline() bool {
-	return client.restClient.IsOnline() && client.gridConn.State() == grid.StateConnected
+	return client.gridConn.State() == grid.StateConnected
 }
 
 // LastConn - returns when the disk is seen to be connected the last time
@@ -236,8 +232,6 @@ func (client *storageRESTClient) Healing() *healingTracker {
 }
 
 func (client *storageRESTClient) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode, _ func() bool) (dataUsageCache, error) {
-	atomic.AddInt32(&client.scanning, 1)
-	defer atomic.AddInt32(&client.scanning, -1)
 	defer xioutil.SafeClose(updates)
 
 	st, err := storageNSScannerRPC.Call(ctx, client.gridConn, &nsScannerOptions{
@@ -301,7 +295,7 @@ func (client *storageRESTClient) SetDiskID(id string) {
 }
 
 func (client *storageRESTClient) DiskInfo(ctx context.Context, opts DiskInfoOptions) (info DiskInfo, err error) {
-	if client.gridConn.State() != grid.StateConnected {
+	if !client.IsOnline() {
 		// make sure to check if the disk is offline, since the underlying
 		// value is cached we should attempt to invalidate it if such calls
 		// were attempted. This can lead to false success under certain conditions
@@ -310,8 +304,8 @@ func (client *storageRESTClient) DiskInfo(ctx context.Context, opts DiskInfoOpti
 		return info, errDiskNotFound
 	}
 
-	// if metrics was asked, or it was a NoOp we do not need to cache the value.
-	if opts.Metrics || opts.NoOp {
+	// if 'NoOp' we do not cache the value.
+	if opts.NoOp {
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
@@ -325,17 +319,16 @@ func (client *storageRESTClient) DiskInfo(ctx context.Context, opts DiskInfoOpti
 		if info.Error != "" {
 			return info, toStorageErr(errors.New(info.Error))
 		}
-		info.Scanning = atomic.LoadInt32(&client.scanning) == 1
 		return info, nil
 	} // In all other cases cache the value upto 1sec.
 
-	client.diskInfoCache.Once.Do(func() {
-		client.diskInfoCache.TTL = time.Second
-		client.diskInfoCache.Update = func() (info DiskInfo, err error) {
+	client.diskInfoCache.InitOnce(time.Second,
+		cachevalue.Opts{CacheError: true},
+		func() (info DiskInfo, err error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			nopts := DiskInfoOptions{DiskID: client.diskID}
+			nopts := DiskInfoOptions{DiskID: client.diskID, Metrics: true}
 			infop, err := storageDiskInfoRPC.Call(ctx, client.gridConn, &nopts)
 			if err != nil {
 				return info, toStorageErr(err)
@@ -345,12 +338,10 @@ func (client *storageRESTClient) DiskInfo(ctx context.Context, opts DiskInfoOpti
 				return info, toStorageErr(errors.New(info.Error))
 			}
 			return info, nil
-		}
-	})
+		},
+	)
 
-	info, err = client.diskInfoCache.Get()
-	info.Scanning = atomic.LoadInt32(&client.scanning) == 1
-	return info, err
+	return client.diskInfoCache.Get()
 }
 
 // MakeVolBulk - create multiple volumes in a bulk operation.
@@ -451,12 +442,19 @@ func (client *storageRESTClient) DeleteVersion(ctx context.Context, volume, path
 
 // WriteAll - write all data to a file.
 func (client *storageRESTClient) WriteAll(ctx context.Context, volume string, path string, b []byte) error {
-	values := make(url.Values)
-	values.Set(storageRESTVolume, volume)
-	values.Set(storageRESTFilePath, path)
-	respBody, err := client.call(ctx, storageRESTMethodWriteAll, values, bytes.NewBuffer(b), int64(len(b)))
-	defer xhttp.DrainBody(respBody)
-	return err
+	// Specific optimization to avoid re-read from the drives for `format.json`
+	// in-case the caller is a network operation.
+	if volume == minioMetaBucket && path == formatConfigFile {
+		client.SetFormatData(b)
+	}
+
+	_, err := storageWriteAllRPC.Call(ctx, client.gridConn, &WriteAllHandlerParams{
+		DiskID:   client.diskID,
+		Volume:   volume,
+		FilePath: path,
+		Buf:      b,
+	})
+	return toStorageErr(err)
 }
 
 // CheckParts - stat all file parts.
@@ -892,7 +890,8 @@ func newStorageRESTClient(endpoint Endpoint, healthCheck bool, gm *grid.Manager)
 		return nil, fmt.Errorf("unable to find connection for %s in targets: %v", endpoint.GridHost(), gm.Targets())
 	}
 	return &storageRESTClient{
-		endpoint: endpoint, restClient: restClient, poolIndex: -1, setIndex: -1, diskIndex: -1,
+		endpoint:      endpoint,
+		restClient:    restClient,
 		gridConn:      conn,
 		diskInfoCache: cachevalue.New[DiskInfo](),
 	}, nil

@@ -311,7 +311,8 @@ var (
 	// Time when the server is started
 	globalBootTime = UTCNow()
 
-	globalActiveCred auth.Credentials
+	globalActiveCred         auth.Credentials
+	globalSiteReplicatorCred siteReplicatorCred
 
 	// Captures if root credentials are set via ENV.
 	globalCredViaEnv bool
@@ -378,13 +379,15 @@ var (
 		return *ptr
 	}
 
-	globalAllHealState *allHealState
+	globalAllHealState = newHealState(GlobalContext, true)
 
 	// The always present healing routine ready to heal objects
-	globalBackgroundHealRoutine *healRoutine
-	globalBackgroundHealState   *allHealState
+	globalBackgroundHealRoutine = newHealRoutine()
+	globalBackgroundHealState   = newHealState(GlobalContext, false)
 
-	globalMRFState mrfState
+	globalMRFState = mrfState{
+		opCh: make(chan partialOperation, mrfOpsQueueSize),
+	}
 
 	// If writes to FS backend should be O_SYNC.
 	globalFSOSync bool

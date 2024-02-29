@@ -30,7 +30,6 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -372,15 +371,7 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 	globalConnWriteDeadline = ctxt.ConnWriteDeadline
 }
 
-var globalHealStateLK sync.RWMutex
-
 func initAllSubsystems(ctx context.Context) {
-	globalHealStateLK.Lock()
-	// New global heal state
-	globalAllHealState = newHealState(ctx, true)
-	globalBackgroundHealState = newHealState(ctx, false)
-	globalHealStateLK.Unlock()
-
 	// Initialize notification peer targets
 	globalNotificationSys = NewNotificationSys(globalEndpoints)
 
@@ -590,7 +581,12 @@ func setGlobalInternodeInterface(interfaceName string) {
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer cancel()
 
-				haddrs, err := globalDNSCache.LookupHost(ctx, host)
+				lookupHost := globalDNSCache.LookupHost
+				if IsKubernetes() || IsDocker() {
+					lookupHost = net.DefaultResolver.LookupHost
+				}
+
+				haddrs, err := lookupHost(ctx, host)
 				if err == nil {
 					ip = haddrs[0]
 				}
@@ -628,7 +624,12 @@ func getServerListenAddrs() []string {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		haddrs, err := globalDNSCache.LookupHost(ctx, host)
+		lookupHost := globalDNSCache.LookupHost
+		if IsKubernetes() || IsDocker() {
+			lookupHost = net.DefaultResolver.LookupHost
+		}
+
+		haddrs, err := lookupHost(ctx, host)
 		if err == nil {
 			for _, addr := range haddrs {
 				addrs.Add(net.JoinHostPort(addr, globalMinioPort))
@@ -651,6 +652,15 @@ func serverMain(ctx *cli.Context) {
 
 	setDefaultProfilerRates()
 
+	// Initialize globalConsoleSys system
+	bootstrapTrace("newConsoleLogger", func() {
+		globalConsoleSys = NewConsoleLogger(GlobalContext)
+		logger.AddSystemTarget(GlobalContext, globalConsoleSys)
+
+		// Set node name, only set for distributed setup.
+		globalConsoleSys.SetNodeName(globalLocalNodeName)
+	})
+
 	// Always load ENV variables from files first.
 	loadEnvVarsFromFiles()
 
@@ -671,15 +681,6 @@ func serverMain(ctx *cli.Context) {
 	// Load the root credentials from the shell environment or from
 	// the config file if not defined, set the default one.
 	loadRootCredentials()
-
-	// Initialize globalConsoleSys system
-	bootstrapTrace("newConsoleLogger", func() {
-		globalConsoleSys = NewConsoleLogger(GlobalContext)
-		logger.AddSystemTarget(GlobalContext, globalConsoleSys)
-
-		// Set node name, only set for distributed setup.
-		globalConsoleSys.SetNodeName(globalLocalNodeName)
-	})
 
 	// Perform any self-tests
 	bootstrapTrace("selftests", func() {
@@ -813,27 +814,6 @@ func serverMain(ctx *cli.Context) {
 		nodeNameSum := sha256.Sum256([]byte(nodeName + globalDeploymentID()))
 		globalNodeNamesHex[hex.EncodeToString(nodeNameSum[:])] = struct{}{}
 	}
-
-	bootstrapTrace("newSharedLock", func() {
-		globalLeaderLock = newSharedLock(GlobalContext, newObject, "leader.lock")
-	})
-
-	// Enable background operations on
-	//
-	// - Disk auto healing
-	// - MRF (most recently failed) healing
-	// - Background expiration routine for lifecycle policies
-	bootstrapTrace("initAutoHeal", func() {
-		initAutoHeal(GlobalContext, newObject)
-	})
-
-	bootstrapTrace("initHealMRF", func() {
-		initHealMRF(GlobalContext, newObject)
-	})
-
-	bootstrapTrace("initBackgroundExpiry", func() {
-		initBackgroundExpiry(GlobalContext, newObject)
-	})
 
 	var err error
 	bootstrapTrace("initServerConfig", func() {

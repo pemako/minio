@@ -88,8 +88,6 @@ func init() {
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
 
-	initGlobalContext()
-
 	globalBatchJobsMetrics = batchJobMetrics{metrics: make(map[string]*batchJobInfo)}
 	go globalBatchJobsMetrics.purgeJobMetrics()
 
@@ -753,7 +751,12 @@ func serverHandleEnvVars() {
 		for _, endpoint := range minioEndpoints {
 			if net.ParseIP(endpoint) == nil {
 				// Checking if the IP is a DNS entry.
-				addrs, err := globalDNSCache.LookupHost(GlobalContext, endpoint)
+				lookupHost := globalDNSCache.LookupHost
+				if IsKubernetes() || IsDocker() {
+					lookupHost = net.DefaultResolver.LookupHost
+				}
+
+				addrs, err := lookupHost(GlobalContext, endpoint)
 				if err != nil {
 					logger.FatalIf(err, "Unable to initialize MinIO server with [%s] invalid entry found in MINIO_PUBLIC_IPS", endpoint)
 				}
