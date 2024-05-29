@@ -36,8 +36,8 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/policy"
-	"github.com/minio/pkg/v2/wildcard"
+	"github.com/minio/pkg/v3/policy"
+	"github.com/minio/pkg/v3/wildcard"
 )
 
 const (
@@ -74,8 +74,11 @@ const (
 	parentClaim = "parent"
 
 	// LDAP claim keys
-	ldapUser  = "ldapUser"
-	ldapUserN = "ldapUsername"
+	ldapUser       = "ldapUser"       // this is a key name for a normalized DN value
+	ldapActualUser = "ldapActualUser" // this is a key name for the actual DN value
+	ldapUserN      = "ldapUsername"   // this is a key name for the short/login username
+	// Claim key-prefix for LDAP attributes
+	ldapAttribPrefix = "ldapAttrib_"
 
 	// Role Claim key
 	roleArnClaim = "roleArn"
@@ -155,12 +158,12 @@ func checkAssumeRoleAuth(ctx context.Context, r *http.Request) (auth.Credentials
 		return auth.Credentials{}, ErrAccessDenied
 	}
 
-	s3Err := isReqAuthenticated(ctx, r, globalSite.Region, serviceSTS)
+	s3Err := isReqAuthenticated(ctx, r, globalSite.Region(), serviceSTS)
 	if s3Err != ErrNone {
 		return auth.Credentials{}, s3Err
 	}
 
-	user, _, s3Err := getReqAccessKeyV4(r, globalSite.Region, serviceSTS)
+	user, _, s3Err := getReqAccessKeyV4(r, globalSite.Region(), serviceSTS)
 	if s3Err != ErrNone {
 		return auth.Credentials{}, s3Err
 	}
@@ -314,7 +317,7 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 
 	// Call hook for site replication.
 	if cred.ParentUser != globalActiveCred.AccessKey {
-		logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+		replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 			Type: madmin.SRIAMItemSTSAcc,
 			STSCredential: &madmin.SRSTSCredential{
 				AccessKey:    cred.AccessKey,
@@ -547,7 +550,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Call hook for site replication.
-	logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+	replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 		Type: madmin.SRIAMItemSTSAcc,
 		STSCredential: &madmin.SRSTSCredential{
 			AccessKey:           cred.AccessKey,
@@ -668,19 +671,25 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 		return
 	}
 
-	ldapUserDN, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(ldapUsername, ldapPassword)
+	lookupResult, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(ldapUsername, ldapPassword)
 	if err != nil {
 		err = fmt.Errorf("LDAP server error: %w", err)
 		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
 		return
 	}
+	ldapUserDN := lookupResult.NormDN
+	ldapActualUserDN := lookupResult.ActualDN
 
 	// Check if this user or their groups have a policy applied.
-	ldapPolicies, _ := globalIAMSys.PolicyDBGet(ldapUserDN, groupDistNames...)
+	ldapPolicies, err := globalIAMSys.PolicyDBGet(ldapUserDN, groupDistNames...)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+		return
+	}
 	if len(ldapPolicies) == 0 && newGlobalAuthZPluginFn() == nil {
 		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 			fmt.Errorf("expecting a policy to be set for user `%s` or one of their groups: `%s` - rejecting this request",
-				ldapUserDN, strings.Join(groupDistNames, "`,`")))
+				ldapActualUserDN, strings.Join(groupDistNames, "`,`")))
 		return
 	}
 
@@ -692,7 +701,12 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 
 	claims[expClaim] = UTCNow().Add(expiryDur).Unix()
 	claims[ldapUser] = ldapUserDN
+	claims[ldapActualUser] = ldapActualUserDN
 	claims[ldapUserN] = ldapUsername
+	// Add lookup up LDAP attributes as claims.
+	for attrib, value := range lookupResult.Attributes {
+		claims[ldapAttribPrefix+attrib] = value
+	}
 
 	if len(sessionPolicyStr) > 0 {
 		claims[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString([]byte(sessionPolicyStr))
@@ -728,7 +742,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	}
 
 	// Call hook for site replication.
-	logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+	replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 		Type: madmin.SRIAMItemSTSAcc,
 		STSCredential: &madmin.SRSTSCredential{
 			AccessKey:    cred.AccessKey,
@@ -898,7 +912,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	}
 
 	// Call hook for site replication.
-	logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+	replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 		Type: madmin.SRIAMItemSTSAcc,
 		STSCredential: &madmin.SRSTSCredential{
 			AccessKey:           tmpCredentials.AccessKey,
@@ -925,7 +939,9 @@ func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *h
 	ctx := newContext(r, w, "AssumeRoleWithCustomToken")
 
 	claims := make(map[string]interface{})
-	defer logger.AuditLog(ctx, w, r, claims)
+
+	auditLogFilterKeys := []string{stsToken}
+	defer logger.AuditLog(ctx, w, r, claims, auditLogFilterKeys...)
 
 	if !globalIAMSys.Initialized() {
 		writeSTSErrorResponse(ctx, w, ErrSTSIAMNotInitialized, errIAMNotInitialized)
@@ -1028,7 +1044,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *h
 	}
 
 	// Call hook for site replication.
-	logger.LogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+	replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
 		Type: madmin.SRIAMItemSTSAcc,
 		STSCredential: &madmin.SRSTSCredential{
 			AccessKey:    tmpCredentials.AccessKey,

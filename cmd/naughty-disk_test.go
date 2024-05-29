@@ -102,14 +102,8 @@ func (d *naughtyDisk) GetDiskLoc() (poolIdx, setIdx, diskIdx int) {
 	return -1, -1, -1
 }
 
-func (d *naughtyDisk) SetDiskLoc(poolIdx, setIdx, diskIdx int) {}
-
 func (d *naughtyDisk) GetDiskID() (string, error) {
 	return d.disk.GetDiskID()
-}
-
-func (d *naughtyDisk) SetFormatData(b []byte) {
-	d.disk.SetFormatData(b)
 }
 
 func (d *naughtyDisk) SetDiskID(id string) {
@@ -207,9 +201,9 @@ func (d *naughtyDisk) AppendFile(ctx context.Context, volume string, path string
 	return d.disk.AppendFile(ctx, volume, path, buf)
 }
 
-func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (uint64, error) {
+func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (RenameDataResp, error) {
 	if err := d.calcError(); err != nil {
-		return 0, err
+		return RenameDataResp{}, err
 	}
 	return d.disk.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath, opts)
 }

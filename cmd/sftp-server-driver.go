@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +34,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio/internal/auth"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/v3/mimedb"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
@@ -100,7 +101,7 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 		}
 		var mcreds *credentials.Credentials
 		if errors.Is(err, errNoSuchServiceAccount) {
-			targetUser, targetGroups, err := globalIAMSys.LDAPConfig.LookupUserDN(f.AccessKey())
+			lookupResult, targetGroups, err := globalIAMSys.LDAPConfig.LookupUserDN(f.AccessKey())
 			if err != nil {
 				return nil, err
 			}
@@ -114,6 +115,14 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 				claims[k] = v
 			}
 
+			// Set LDAP claims.
+			claims[ldapUserN] = f.AccessKey()
+			claims[ldapUser] = lookupResult.NormDN
+			// Add LDAP attributes that were looked up into the claims.
+			for attribKey, attribValue := range lookupResult.Attributes {
+				claims[ldapAttribPrefix+attribKey] = attribValue
+			}
+
 			cred, err := auth.GetNewCredentialsWithMetadata(claims, globalActiveCred.SecretKey)
 			if err != nil {
 				return nil, err
@@ -121,7 +130,7 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 
 			// Set the parent of the temporary access key, this is useful
 			// in obtaining service accounts by this cred.
-			cred.ParentUser = targetUser
+			cred.ParentUser = lookupResult.NormDN
 
 			// Set this value to LDAP groups, LDAP user can be part
 			// of large number of groups
@@ -136,7 +145,7 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 			}
 
 			// Call hook for site replication.
-			logger.LogIf(context.Background(), globalSiteReplicationSys.IAMChangeHook(context.Background(), madmin.SRIAMItem{
+			replLogIf(context.Background(), globalSiteReplicationSys.IAMChangeHook(context.Background(), madmin.SRIAMItem{
 				Type: madmin.SRIAMItemSTSAcc,
 				STSCredential: &madmin.SRSTSCredential{
 					AccessKey:    cred.AccessKey,
@@ -320,7 +329,10 @@ func (f *sftpDriver) Filewrite(r *sftp.Request) (w io.WriterAt, err error) {
 	}
 	wa.wg.Add(1)
 	go func() {
-		_, err := clnt.PutObject(r.Context(), bucket, object, pr, -1, minio.PutObjectOptions{SendContentMd5: true})
+		_, err := clnt.PutObject(r.Context(), bucket, object, pr, -1, minio.PutObjectOptions{
+			ContentType:          mimedb.TypeByExtension(path.Ext(object)),
+			DisableContentSha256: true,
+		})
 		pr.CloseWithError(err)
 		wa.wg.Done()
 	}()
@@ -338,7 +350,7 @@ func (f *sftpDriver) Filecmd(r *sftp.Request) (err error) {
 
 	switch r.Method {
 	case "Setstat", "Rename", "Link", "Symlink":
-		return NotImplemented{}
+		return sftp.ErrSSHFxOpUnsupported
 
 	case "Rmdir":
 		bucket, prefix := path2BucketObject(r.Filepath)
@@ -394,16 +406,13 @@ func (f *sftpDriver) Filecmd(r *sftp.Request) (err error) {
 		}
 
 		if prefix == "" {
-			return clnt.MakeBucket(context.Background(), bucket, minio.MakeBucketOptions{Region: globalSite.Region})
+			return clnt.MakeBucket(context.Background(), bucket, minio.MakeBucketOptions{Region: globalSite.Region()})
 		}
 
 		dirPath := buildMinioDir(prefix)
 
 		_, err = clnt.PutObject(context.Background(), bucket, dirPath, bytes.NewReader([]byte("")), 0,
-			// Always send Content-MD5 to succeed with bucket with
-			// locking enabled. There is no performance hit since
-			// this is always an empty object
-			minio.PutObjectOptions{SendContentMd5: true},
+			minio.PutObjectOptions{DisableContentSha256: true},
 		)
 		return err
 	}

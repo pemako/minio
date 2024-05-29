@@ -29,7 +29,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // IPv4 addresses of local host.
@@ -98,12 +98,7 @@ func mustGetLocalIP6() (ipList set.StringSet) {
 
 // getHostIP returns IP address of given host.
 func getHostIP(host string) (ipList set.StringSet, err error) {
-	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = net.DefaultResolver.LookupHost
-	}
-
-	addrs, err := lookupHost(GlobalContext, host)
+	addrs, err := globalDNSCache.LookupHost(GlobalContext, host)
 	if err != nil {
 		return ipList, err
 	}

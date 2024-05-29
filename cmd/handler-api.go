@@ -18,9 +18,11 @@
 package cmd
 
 import (
+	"math"
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,13 +39,11 @@ import (
 type apiConfig struct {
 	mu sync.RWMutex
 
-	requestsDeadline time.Duration
-	requestsPool     chan struct{}
-	clusterDeadline  time.Duration
-	listQuorum       string
-	corsAllowOrigins []string
-	// total drives per erasure set across pools.
-	totalDriveCount       int
+	requestsDeadline      time.Duration
+	requestsPool          chan struct{}
+	clusterDeadline       time.Duration
+	listQuorum            string
+	corsAllowOrigins      []string
 	replicationPriority   string
 	replicationMaxWorkers int
 	transitionWorkers     int
@@ -55,6 +55,7 @@ type apiConfig struct {
 	gzipObjects                 bool
 	rootAccess                  bool
 	syncEvents                  bool
+	objectMaxVersions           int64
 }
 
 const (
@@ -87,14 +88,14 @@ func cgroupMemLimit() (limit uint64) {
 }
 
 func availableMemory() (available uint64) {
-	available = 8 << 30 // Default to 8 GiB when we can't find the limits.
+	available = 2048 * blockSizeV2 * 2 // Default to 4 GiB when we can't find the limits.
 
 	if runtime.GOOS == "linux" {
 		// Useful in container mode
 		limit := cgroupMemLimit()
 		if limit > 0 {
-			// A valid value is found
-			available = limit
+			// A valid value is found, return its 75%
+			available = (limit * 3) / 4
 			return
 		}
 	} // for all other platforms limits are based on virtual memory.
@@ -103,11 +104,12 @@ func availableMemory() (available uint64) {
 	if err != nil {
 		return
 	}
-	available = memStats.Available / 2
+	// A valid value is available return its 75%
+	available = (memStats.Available * 3) / 4
 	return
 }
 
-func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
+func (t *apiConfig) init(cfg api.Config, setDriveCounts []int, legacy bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -122,32 +124,34 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 	}
 	t.corsAllowOrigins = corsAllowOrigin
 
-	maxSetDrives := 0
-	for _, setDriveCount := range setDriveCounts {
-		t.totalDriveCount += setDriveCount
-		if setDriveCount > maxSetDrives {
-			maxSetDrives = setDriveCount
-		}
-	}
-
 	var apiRequestsMaxPerNode int
 	if cfg.RequestsMax <= 0 {
+		maxSetDrives := slices.Max(setDriveCounts)
+
+		// Returns 75% of max memory allowed
 		maxMem := availableMemory()
 
 		// max requests per node is calculated as
 		// total_ram / ram_per_request
-		// ram_per_request is (2MiB+128KiB) * driveCount \
-		//    + 2 * 10MiB (default erasure block size v1) + 2 * 1MiB (default erasure block size v2)
-		blockSize := xioutil.BlockSizeLarge + xioutil.BlockSizeSmall
-		apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV1*2+blockSizeV2*2)))
-		if globalIsDistErasure {
-			logger.Info("Automatically configured API requests per node based on available memory on the system: %d", apiRequestsMaxPerNode)
+		blockSize := xioutil.LargeBlock + xioutil.SmallBlock
+		if legacy {
+			// ram_per_request is (1MiB+32KiB) * driveCount \
+			//    + 2 * 10MiB (default erasure block size v1) + 2 * 1MiB (default erasure block size v2)
+			apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV1*2+blockSizeV2*2)))
+		} else {
+			// ram_per_request is (1MiB+32KiB) * driveCount \
+			//    + 2 * 1MiB (default erasure block size v2)
+			apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV2*2)))
 		}
 	} else {
 		apiRequestsMaxPerNode = cfg.RequestsMax
 		if n := totalNodeCount(); n > 0 {
 			apiRequestsMaxPerNode /= n
 		}
+	}
+
+	if globalIsDistErasure {
+		logger.Info("Configured max API requests per node based on available memory: %d", apiRequestsMaxPerNode)
 	}
 
 	if cap(t.requestsPool) != apiRequestsMaxPerNode {
@@ -170,7 +174,9 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 	}
 	t.replicationPriority = cfg.ReplicationPriority
 	t.replicationMaxWorkers = cfg.ReplicationMaxWorkers
-	if globalTransitionState != nil && cfg.TransitionWorkers != t.transitionWorkers {
+
+	// N B api.transition_workers will be deprecated
+	if globalTransitionState != nil {
 		globalTransitionState.UpdateWorkers(cfg.TransitionWorkers)
 	}
 	t.transitionWorkers = cfg.TransitionWorkers
@@ -182,6 +188,7 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 	t.gzipObjects = cfg.GzipObjects
 	t.rootAccess = cfg.RootAccess
 	t.syncEvents = cfg.SyncEvents
+	t.objectMaxVersions = cfg.ObjectMaxVersions
 }
 
 func (t *apiConfig) odirectEnabled() bool {
@@ -285,7 +292,11 @@ func (t *apiConfig) getRequestsPool() (chan struct{}, time.Duration) {
 	defer t.mu.RUnlock()
 
 	if t.requestsPool == nil {
-		return nil, time.Duration(0)
+		return nil, 10 * time.Second
+	}
+
+	if t.requestsDeadline <= 0 {
+		return t.requestsPool, 10 * time.Second
 	}
 
 	return t.requestsPool, t.requestsDeadline
@@ -310,13 +321,21 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
+		globalHTTPStats.addRequestsInQueue(1)
+		defer globalHTTPStats.addRequestsInQueue(-1)
+
 		pool, deadline := globalAPIConfig.getRequestsPool()
 		if pool == nil {
 			f.ServeHTTP(w, r)
 			return
 		}
 
-		globalHTTPStats.addRequestsInQueue(1)
+		// No deadline to wait, there is nothing to queue
+		// perform the API call immediately.
+		if deadline <= 0 {
+			f.ServeHTTP(w, r)
+			return
+		}
 
 		if tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt); ok {
 			tc.FuncName = "s3.MaxClients"
@@ -325,25 +344,29 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 		deadlineTimer := time.NewTimer(deadline)
 		defer deadlineTimer.Stop()
 
+		ctx := r.Context()
 		select {
 		case pool <- struct{}{}:
 			defer func() { <-pool }()
-			globalHTTPStats.addRequestsInQueue(-1)
+			if contextCanceled(ctx) {
+				w.WriteHeader(499)
+				return
+			}
 			f.ServeHTTP(w, r)
 		case <-deadlineTimer.C:
+			if contextCanceled(ctx) {
+				w.WriteHeader(499)
+				return
+			}
 			// Send a http timeout message
-			writeErrorResponse(r.Context(), w,
+			writeErrorResponse(ctx, w,
 				errorCodes.ToAPIErr(ErrTooManyRequests),
 				r.URL)
-			globalHTTPStats.addRequestsInQueue(-1)
-			return
 		case <-r.Context().Done():
 			// When the client disconnects before getting the S3 handler
 			// status code response, set the status code to 499 so this request
 			// will be properly audited and traced.
 			w.WriteHeader(499)
-			globalHTTPStats.addRequestsInQueue(-1)
-			return
 		}
 	}
 }
@@ -381,4 +404,16 @@ func (t *apiConfig) isSyncEventsEnabled() bool {
 	defer t.mu.RUnlock()
 
 	return t.syncEvents
+}
+
+func (t *apiConfig) getObjectMaxVersions() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.objectMaxVersions <= 0 {
+		// defaults to 'IntMax' when unset.
+		return math.MaxInt64
+	}
+
+	return t.objectMaxVersions
 }

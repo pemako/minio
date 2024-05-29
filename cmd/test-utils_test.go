@@ -66,7 +66,7 @@ import (
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // TestMain to set up global env.
@@ -106,10 +106,10 @@ func TestMain(m *testing.M) {
 	// logger.AddTarget(console.New())
 
 	// Set system resources to maximum.
-	setMaxResources()
+	setMaxResources(nil)
 
 	// Initialize globalConsoleSys system
-	globalConsoleSys = NewConsoleLogger(context.Background())
+	globalConsoleSys = NewConsoleLogger(context.Background(), io.Discard)
 
 	globalInternodeTransport = NewInternodeHTTPTransport(0)()
 
@@ -215,6 +215,27 @@ func prepareErasure(ctx context.Context, nDisks int) (ObjectLayer, []string, err
 	if err != nil {
 		removeRoots(fsDirs)
 		return nil, nil, err
+	}
+
+	// Wait up to 10 seconds for disks to come online.
+	pools := obj.(*erasureServerPools)
+	t := time.Now()
+	for _, pool := range pools.serverPools {
+		for _, sets := range pool.erasureDisks {
+			for _, s := range sets {
+				if !s.IsLocal() {
+					for {
+						if s.IsOnline() {
+							break
+						}
+						time.Sleep(100 * time.Millisecond)
+						if time.Since(t) > 10*time.Second {
+							return nil, nil, errors.New("timeout waiting for disk to come online")
+						}
+					}
+				}
+			}
+		}
 	}
 
 	return obj, fsDirs, nil
@@ -729,7 +750,7 @@ func newTestStreamingRequest(method, urlStr string, dataLength, chunkSize int64,
 func assembleStreamingChunks(req *http.Request, body io.ReadSeeker, chunkSize int64,
 	secretKey, signature string, currTime time.Time) (*http.Request, error,
 ) {
-	regionStr := globalSite.Region
+	regionStr := globalSite.Region()
 	var stream []byte
 	var buffer []byte
 	body.Seek(0, 0)
@@ -837,7 +858,7 @@ func preSignV4(req *http.Request, accessKeyID, secretAccessKey string, expires i
 		return errors.New("Presign cannot be generated without access and secret keys")
 	}
 
-	region := globalSite.Region
+	region := globalSite.Region()
 	date := UTCNow()
 	scope := getScope(date, region)
 	credential := fmt.Sprintf("%s/%s", accessKeyID, scope)
@@ -965,7 +986,7 @@ func signRequestV4(req *http.Request, accessKey, secretKey string) error {
 	}
 	sort.Strings(headers)
 
-	region := globalSite.Region
+	region := globalSite.Region()
 
 	// Get canonical headers.
 	var buf bytes.Buffer
@@ -1378,7 +1399,7 @@ func getListObjectVersionsURL(endPoint, bucketName, prefix, maxKeys, encodingTyp
 }
 
 // return URL for listing objects in the bucket with V2 API.
-func getListObjectsV2URL(endPoint, bucketName, prefix, maxKeys, fetchOwner, encodingType string) string {
+func getListObjectsV2URL(endPoint, bucketName, prefix, maxKeys, fetchOwner, encodingType, delimiter string) string {
 	queryValue := url.Values{}
 	queryValue.Set("list-type", "2") // Enables list objects V2 URL.
 	if maxKeys != "" {
@@ -1390,7 +1411,13 @@ func getListObjectsV2URL(endPoint, bucketName, prefix, maxKeys, fetchOwner, enco
 	if encodingType != "" {
 		queryValue.Set("encoding-type", encodingType)
 	}
-	return makeTestTargetURL(endPoint, bucketName, prefix, queryValue)
+	if prefix != "" {
+		queryValue.Set("prefix", prefix)
+	}
+	if delimiter != "" {
+		queryValue.Set("delimiter", delimiter)
+	}
+	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
 }
 
 // return URL for a new multipart upload.
@@ -1664,7 +1691,7 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 	}
 }
 
-// ExecObjectLayerAPINilTest - Sets the object layer to `nil`, and calls rhe registered object layer API endpoint,
+// ExecObjectLayerAPINilTest - Sets the object layer to `nil`, and calls the registered object layer API endpoint,
 // and assert the error response. The purpose is to validate the API handlers response when the object layer is uninitialized.
 // Usage hint: Should be used at the end of the API end points tests (ex: check the last few lines of `testAPIListObjectPartsHandler`),
 // need a sample HTTP request to be sent as argument so that the relevant handler is called, the handler registration is expected

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+echo "Running $0"
+
 if [ -n "$TEST_DEBUG" ]; then
 	set -x
 fi
@@ -56,6 +58,9 @@ sleep 3
 
 export MC_HOST_myminio1=http://minioadmin:minioadmin@localhost:9001
 export MC_HOST_myminio2=http://minioadmin:minioadmin@localhost:9002
+
+./mc ready myminio1
+./mc ready myminio2
 
 ./mc mb myminio1/testbucket/
 ./mc version enable myminio1/testbucket/

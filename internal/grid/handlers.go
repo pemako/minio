@@ -27,7 +27,6 @@ import (
 
 	"github.com/minio/minio/internal/hash/sha256"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -110,6 +109,9 @@ const (
 	HandlerSignalService
 	HandlerGetBandwidth
 	HandlerWriteAll
+	HandlerListBuckets
+	HandlerRenameDataInline
+	HandlerRenameData2
 
 	// Add more above here ^^^
 	// If all handlers are used, the type of Handler can be changed.
@@ -187,6 +189,9 @@ var handlerPrefixes = [handlerLast]string{
 	HandlerStorageInfo:                 peerPrefix,
 	HandlerConsoleLog:                  peerPrefix,
 	HandlerListDir:                     storagePrefix,
+	HandlerListBuckets:                 peerPrefixS3,
+	HandlerRenameDataInline:            storagePrefix,
+	HandlerRenameData2:                 storagePrefix,
 }
 
 const (
@@ -463,7 +468,7 @@ func (h *SingleHandler[Req, Resp]) AllowCallRequestPool(b bool) *SingleHandler[R
 // This may only be set ONCE before use.
 func (h *SingleHandler[Req, Resp]) IgnoreNilConn() *SingleHandler[Req, Resp] {
 	if h.ignoreNilConn {
-		logger.LogOnceIf(context.Background(), fmt.Errorf("%s: IgnoreNilConn called twice", h.id.String()), h.id.String()+"IgnoreNilConn")
+		gridLogOnceIf(context.Background(), fmt.Errorf("%s: IgnoreNilConn called twice", h.id.String()), h.id.String()+"IgnoreNilConn")
 	}
 	h.ignoreNilConn = true
 	return h
@@ -544,7 +549,7 @@ func (h *SingleHandler[Req, Resp]) Call(ctx context.Context, c Requester, req Re
 		}
 		return resp, ErrDisconnected
 	}
-	payload, err := req.MarshalMsg(GetByteBuffer()[:0])
+	payload, err := req.MarshalMsg(GetByteBufferCap(req.Msgsize()))
 	if err != nil {
 		return resp, err
 	}
@@ -764,7 +769,7 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) register(m *Manager, handle func
 							input := h.NewRequest()
 							_, err := input.UnmarshalMsg(v)
 							if err != nil {
-								logger.LogOnceIf(ctx, err, err.Error())
+								gridLogOnceIf(ctx, err, err.Error())
 							}
 							PutByteBuffer(v)
 							// Send input
@@ -786,10 +791,9 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) register(m *Manager, handle func
 					if dropOutput {
 						continue
 					}
-					dst := GetByteBuffer()
-					dst, err := v.MarshalMsg(dst[:0])
+					dst, err := v.MarshalMsg(GetByteBufferCap(v.Msgsize()))
 					if err != nil {
-						logger.LogOnceIf(ctx, err, err.Error())
+						gridLogOnceIf(ctx, err, err.Error())
 					}
 					if !h.sharedResponse {
 						h.PutResponse(v)
@@ -851,7 +855,7 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) Call(ctx context.Context, c Stre
 	var payloadB []byte
 	if h.WithPayload {
 		var err error
-		payloadB, err = payload.MarshalMsg(GetByteBuffer()[:0])
+		payloadB, err = payload.MarshalMsg(GetByteBufferCap(payload.Msgsize()))
 		if err != nil {
 			return nil, err
 		}
@@ -873,9 +877,9 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) Call(ctx context.Context, c Stre
 		go func() {
 			defer xioutil.SafeClose(stream.Requests)
 			for req := range reqT {
-				b, err := req.MarshalMsg(GetByteBuffer()[:0])
+				b, err := req.MarshalMsg(GetByteBufferCap(req.Msgsize()))
 				if err != nil {
-					logger.LogOnceIf(ctx, err, err.Error())
+					gridLogOnceIf(ctx, err, err.Error())
 				}
 				h.PutRequest(req)
 				stream.Requests <- b

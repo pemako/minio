@@ -20,7 +20,9 @@ package grid
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -29,7 +31,6 @@ import (
 	"github.com/gobwas/ws/wsutil"
 	"github.com/google/uuid"
 	"github.com/minio/madmin-go/v3"
-	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/mux"
 )
@@ -142,7 +143,7 @@ func (m *Manager) Handler() http.HandlerFunc {
 			if r := recover(); r != nil {
 				debug.PrintStack()
 				err := fmt.Errorf("grid: panic: %v\n", r)
-				logger.LogIf(context.Background(), err, err.Error())
+				gridLogIf(context.Background(), err, err.Error())
 				w.WriteHeader(http.StatusInternalServerError)
 			}
 		}()
@@ -151,7 +152,7 @@ func (m *Manager) Handler() http.HandlerFunc {
 		}
 		ctx := req.Context()
 		if err := m.authRequest(req); err != nil {
-			logger.LogOnceIf(ctx, fmt.Errorf("auth %s: %w", req.RemoteAddr, err), req.RemoteAddr+err.Error())
+			gridLogOnceIf(ctx, fmt.Errorf("auth %s: %w", req.RemoteAddr, err), req.RemoteAddr)
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -168,7 +169,10 @@ func (m *Manager) Handler() http.HandlerFunc {
 			if err == nil {
 				return
 			}
-			logger.LogOnceIf(ctx, err, err.Error())
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			gridLogOnceIf(ctx, err, req.RemoteAddr)
 			resp := connectResp{
 				ID:             m.ID,
 				Accepted:       false,

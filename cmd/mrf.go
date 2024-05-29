@@ -21,7 +21,9 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/pkg/v3/wildcard"
 )
 
 const (
@@ -34,7 +36,7 @@ type partialOperation struct {
 	bucket              string
 	object              string
 	versionID           string
-	allVersions         bool
+	versions            []byte
 	setIndex, poolIndex int
 	queued              time.Time
 	scanMode            madmin.HealScanMode
@@ -73,6 +75,25 @@ func (m *mrfState) healRoutine(z *erasureServerPools) {
 				return
 			}
 
+			// We might land at .metacache, .trash, .multipart
+			// no need to heal them skip, only when bucket
+			// is '.minio.sys'
+			if u.bucket == minioMetaBucket {
+				// No MRF needed for temporary objects
+				if wildcard.Match("buckets/*/.metacache/*", u.object) {
+					continue
+				}
+				if wildcard.Match("tmp/*", u.object) {
+					continue
+				}
+				if wildcard.Match("multipart/*", u.object) {
+					continue
+				}
+				if wildcard.Match("tmp-old/*", u.object) {
+					continue
+				}
+			}
+
 			now := time.Now()
 			if now.Sub(u.queued) < time.Second {
 				// let recently failed networks to reconnect
@@ -91,8 +112,13 @@ func (m *mrfState) healRoutine(z *erasureServerPools) {
 			if u.object == "" {
 				healBucket(u.bucket, scan)
 			} else {
-				if u.allVersions {
-					z.serverPools[u.poolIndex].sets[u.setIndex].listAndHeal(u.bucket, u.object, u.scanMode, healObjectVersionsDisparity)
+				if len(u.versions) > 0 {
+					vers := len(u.versions) / 16
+					if vers > 0 {
+						for i := 0; i < vers; i++ {
+							healObject(u.bucket, u.object, uuid.UUID(u.versions[16*i:]).String(), scan)
+						}
+					}
 				} else {
 					healObject(u.bucket, u.object, u.versionID, scan)
 				}

@@ -27,7 +27,6 @@ import (
 	"time"
 
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
 	"github.com/zeebo/xxh3"
 )
 
@@ -145,7 +144,7 @@ func (m *muxClient) send(msg message) error {
 // sendLocked the message. msg.Seq and msg.MuxID will be set.
 // m.respMu must be held.
 func (m *muxClient) sendLocked(msg message) error {
-	dst := GetByteBuffer()[:0]
+	dst := GetByteBufferCap(msg.Msgsize())
 	msg.Seq = m.SendSeq
 	msg.MuxID = m.MuxID
 	msg.Flags |= m.BaseFlags
@@ -289,7 +288,7 @@ func (m *muxClient) addErrorNonBlockingClose(respHandler chan<- Response, err er
 				xioutil.SafeClose(respHandler)
 			}()
 		}
-		logger.LogIf(m.ctx, m.sendLocked(message{Op: OpDisconnectServerMux, MuxID: m.MuxID}))
+		gridLogIf(m.ctx, m.sendLocked(message{Op: OpDisconnectServerMux, MuxID: m.MuxID}))
 		m.closed = true
 	}
 }
@@ -332,26 +331,58 @@ func (m *muxClient) handleOneWayStream(respHandler chan<- Response, respServer <
 			if !ok {
 				return
 			}
+		sendResp:
 			select {
 			case respHandler <- resp:
 				m.respMu.Lock()
 				if !m.closed {
-					logger.LogIf(m.ctx, m.sendLocked(message{Op: OpUnblockSrvMux, MuxID: m.MuxID}))
+					gridLogIf(m.ctx, m.sendLocked(message{Op: OpUnblockSrvMux, MuxID: m.MuxID}))
 				}
 				m.respMu.Unlock()
 			case <-m.ctx.Done():
 				// Client canceled. Don't block.
 				// Next loop will catch it.
+			case <-pingTimer:
+				if !m.doPing(respHandler) {
+					return
+				}
+				goto sendResp
 			}
 		case <-pingTimer:
-			if time.Since(time.Unix(atomic.LoadInt64(&m.LastPong), 0)) > clientPingInterval*2 {
-				m.addErrorNonBlockingClose(respHandler, ErrDisconnected)
+			if !m.doPing(respHandler) {
 				return
 			}
-			// Send new ping.
-			logger.LogIf(m.ctx, m.send(message{Op: OpPing, MuxID: m.MuxID}))
 		}
 	}
+}
+
+// doPing checks last ping time and sends another ping.
+func (m *muxClient) doPing(respHandler chan<- Response) (ok bool) {
+	m.respMu.Lock()
+	if m.closed {
+		m.respMu.Unlock()
+		// Already closed. This is not an error state;
+		// we may just be delivering the last responses.
+		return true
+	}
+
+	// Only check ping when not closed.
+	if got := time.Since(time.Unix(atomic.LoadInt64(&m.LastPong), 0)); got > clientPingInterval*2 {
+		m.respMu.Unlock()
+		if debugPrint {
+			fmt.Printf("Mux %d: last pong %v ago, disconnecting\n", m.MuxID, got)
+		}
+		m.addErrorNonBlockingClose(respHandler, ErrDisconnected)
+		return false
+	}
+
+	// Send new ping
+	err := m.sendLocked(message{Op: OpPing, MuxID: m.MuxID})
+	m.respMu.Unlock()
+	if err != nil {
+		m.addErrorNonBlockingClose(respHandler, err)
+	}
+	return err == nil
 }
 
 // responseCh is the channel to that goes to the requester.
@@ -509,7 +540,7 @@ func (m *muxClient) unblockSend(seq uint32) {
 	select {
 	case m.outBlock <- struct{}{}:
 	default:
-		logger.LogIf(m.ctx, errors.New("output unblocked overflow"))
+		gridLogIf(m.ctx, errors.New("output unblocked overflow"))
 	}
 }
 
@@ -548,7 +579,7 @@ func (m *muxClient) addResponse(r Response) (ok bool) {
 			return
 		}
 		err := errors.New("INTERNAL ERROR: Response was blocked")
-		logger.LogIf(m.ctx, err)
+		gridLogIf(m.ctx, err)
 		m.closeLocked()
 		return false
 	}

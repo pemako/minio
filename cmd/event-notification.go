@@ -28,9 +28,8 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // EventNotifier - notifies external systems about events in MinIO.
@@ -55,7 +54,7 @@ func (evnot *EventNotifier) GetARNList(onlyActive bool) []string {
 	if evnot == nil {
 		return arns
 	}
-	region := globalSite.Region
+	region := globalSite.Region()
 	for targetID, target := range evnot.targetList.TargetMap() {
 		// httpclient target is part of ListenNotification
 		// which doesn't need to be listed as part of the ARN list
@@ -80,10 +79,11 @@ func (evnot *EventNotifier) set(bucket BucketInfo, meta BucketMetadata) {
 	if config == nil {
 		return
 	}
-	config.SetRegion(globalSite.Region)
-	if err := config.Validate(globalSite.Region, globalEventNotifier.targetList); err != nil {
+	region := globalSite.Region()
+	config.SetRegion(region)
+	if err := config.Validate(region, globalEventNotifier.targetList); err != nil {
 		if _, ok := err.(*event.ErrARNNotFound); !ok {
-			logger.LogIf(GlobalContext, err)
+			internalLogIf(GlobalContext, err)
 		}
 	}
 	evnot.AddRulesMap(bucket.Name, config.ToRulesMap())
