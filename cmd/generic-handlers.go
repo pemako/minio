@@ -247,11 +247,14 @@ func guessIsRPCReq(req *http.Request) bool {
 	if req == nil {
 		return false
 	}
-	if req.Method == http.MethodGet && req.URL != nil && req.URL.Path == grid.RoutePath {
-		return true
+	if req.Method == http.MethodGet && req.URL != nil {
+		switch req.URL.Path {
+		case grid.RoutePath, grid.RouteLockPath:
+			return true
+		}
 	}
 
-	return req.Method == http.MethodPost &&
+	return (req.Method == http.MethodPost || req.Method == http.MethodGet) &&
 		strings.HasPrefix(req.URL.Path, minioReservedBucketPath+SlashSeparator)
 }
 
@@ -469,7 +472,7 @@ func setBucketForwardingMiddleware(h http.Handler) http.Handler {
 		}
 		if globalDNSConfig == nil || !globalBucketFederation ||
 			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
-			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) {
+			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) || isKMSReq(r) {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -601,13 +604,6 @@ func setUploadForwardingMiddleware(h http.Handler) http.Handler {
 				h.ServeHTTP(w, r)
 				return
 			}
-			// forward request to peer handling this upload
-			if globalBucketTargetSys.isOffline(remote.EndpointURL) {
-				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
-				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrReplicationRemoteConnectionError), r.URL)
-				return
-			}
-
 			r.URL.Scheme = remote.EndpointURL.Scheme
 			r.URL.Host = remote.EndpointURL.Host
 			// Make sure we remove any existing headers before

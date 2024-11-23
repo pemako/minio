@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
@@ -226,7 +227,9 @@ func runDataScanner(ctx context.Context, objAPI ObjectLayer) {
 				binary.LittleEndian.PutUint64(tmp, cycleInfo.next)
 				tmp, _ = cycleInfo.MarshalMsg(tmp)
 				err = saveConfig(ctx, objAPI, dataUsageBloomNamePath, tmp)
-				scannerLogIf(ctx, err, dataUsageBloomNamePath)
+				if err != nil {
+					scannerLogIf(ctx, fmt.Errorf("%w, Object %s", err, dataUsageBloomNamePath))
+				}
 			}
 		}
 	}
@@ -249,7 +252,8 @@ type folderScanner struct {
 	healObjectSelect      uint32 // Do a heal check on an object once every n cycles. Must divide into healFolderInclude
 	scanMode              madmin.HealScanMode
 
-	weSleep func() bool
+	weSleep    func() bool
+	shouldHeal func() bool
 
 	disks       []StorageAPI
 	disksQuorum int
@@ -304,11 +308,12 @@ type folderScanner struct {
 // The returned cache will always be valid, but may not be updated from the existing.
 // Before each operation sleepDuration is called which can be used to temporarily halt the scanner.
 // If the supplied context is canceled the function will return at the first chance.
-func scanDataFolder(ctx context.Context, disks []StorageAPI, basePath string, cache dataUsageCache, getSize getSizeFn, scanMode madmin.HealScanMode, weSleep func() bool) (dataUsageCache, error) {
+func scanDataFolder(ctx context.Context, disks []StorageAPI, drive *xlStorage, cache dataUsageCache, getSize getSizeFn, scanMode madmin.HealScanMode, weSleep func() bool) (dataUsageCache, error) {
 	switch cache.Info.Name {
 	case "", dataUsageRoot:
 		return cache, errors.New("internal error: root scan attempted")
 	}
+	basePath := drive.drivePath
 	updatePath, closeDisk := globalScannerMetrics.currentPathUpdater(basePath, cache.Info.Name)
 	defer closeDisk()
 
@@ -326,6 +331,26 @@ func scanDataFolder(ctx context.Context, disks []StorageAPI, basePath string, ca
 		updateCurrentPath:     updatePath,
 		disks:                 disks,
 		disksQuorum:           len(disks) / 2,
+	}
+
+	var skipHeal atomic.Bool
+	if globalIsErasure || cache.Info.SkipHealing {
+		skipHeal.Store(true)
+	}
+
+	// Check if we should do healing at all.
+	s.shouldHeal = func() bool {
+		if skipHeal.Load() {
+			return false
+		}
+		if s.healObjectSelect == 0 {
+			return false
+		}
+		if di, _ := drive.DiskInfo(ctx, DiskInfoOptions{}); di.Healing {
+			skipHeal.Store(true)
+			return false
+		}
+		return true
 	}
 
 	// Enable healing in XL mode.
@@ -482,13 +507,8 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				replication: replicationCfg,
 			}
 
-			item.heal.enabled = thisHash.modAlt(f.oldCache.Info.NextCycle/folder.objectHealProbDiv, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure
+			item.heal.enabled = thisHash.modAlt(f.oldCache.Info.NextCycle/folder.objectHealProbDiv, f.healObjectSelect/folder.objectHealProbDiv) && f.shouldHeal()
 			item.heal.bitrot = f.scanMode == madmin.HealDeepScan
-
-			// if the drive belongs to an erasure set
-			// that is already being healed, skip the
-			// healing attempt on this drive.
-			item.heal.enabled = item.heal.enabled && f.healObjectSelect > 0
 
 			sz, err := f.getSize(item)
 			if err != nil && err != errIgnoreFileContrib {
@@ -549,7 +569,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				APIName: "Scanner",
 				Bucket:  f.root,
 				Object:  prefixName,
-				Tags: map[string]interface{}{
+				Tags: map[string]string{
 					"x-minio-prefixes-total": strconv.Itoa(totalFolders),
 				},
 			})
@@ -652,7 +672,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		}
 
 		// Scan for healing
-		if f.healObjectSelect == 0 || len(abandonedChildren) == 0 {
+		if len(abandonedChildren) == 0 || !f.shouldHeal() {
 			// If we are not heal scanning, return now.
 			break
 		}
@@ -687,6 +707,9 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 
 		healObjectsPrefix := color.Green("healObjects:")
 		for k := range abandonedChildren {
+			if !f.shouldHeal() {
+				break
+			}
 			bucket, prefix := path2BucketObject(k)
 			stopFn := globalScannerMetrics.time(scannerMetricCheckMissing)
 			f.updateCurrentPath(k)
@@ -720,6 +743,10 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				},
 				// Some disks have data for this.
 				partial: func(entries metaCacheEntries, errs []error) {
+					if !f.shouldHeal() {
+						cancel()
+						return
+					}
 					entry, ok := entries.resolve(&resolver)
 					if !ok {
 						// check if we can get one entry at least
@@ -772,7 +799,9 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 						}, madmin.HealItemObject)
 						stopFn(int(ver.Size))
 						if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-							scannerLogIf(ctx, err, fiv.Name)
+							if err != nil {
+								scannerLogIf(ctx, fmt.Errorf("%w, Object %s/%s/%s", err, bucket, fiv.Name, ver.VersionID))
+							}
 						}
 						if err == nil {
 							successVersions++
@@ -1109,7 +1138,7 @@ func (i *scannerItem) applyVersionActions(ctx context.Context, o ObjectLayer, fi
 			APIName: "Scanner",
 			Bucket:  i.bucket,
 			Object:  i.objectPath(),
-			Tags: map[string]interface{}{
+			Tags: map[string]string{
 				"x-minio-versions": strconv.Itoa(len(objInfos)),
 			},
 		})
@@ -1141,7 +1170,7 @@ func (i *scannerItem) applyVersionActions(ctx context.Context, o ObjectLayer, fi
 			APIName: "Scanner",
 			Bucket:  i.bucket,
 			Object:  i.objectPath(),
-			Tags: map[string]interface{}{
+			Tags: map[string]string{
 				"x-minio-versions-count": strconv.Itoa(len(objInfos)),
 				"x-minio-versions-size":  strconv.FormatInt(cumulativeSize, 10),
 			},
@@ -1233,7 +1262,7 @@ func evalActionFromLifecycle(ctx context.Context, lc lifecycle.Lifecycle, lr loc
 }
 
 func applyTransitionRule(event lifecycle.Event, src lcEventSrc, obj ObjectInfo) bool {
-	if obj.DeleteMarker {
+	if obj.DeleteMarker || obj.IsDir {
 		return false
 	}
 	globalTransitionState.queueTransitionTask(obj, event, src)
@@ -1246,7 +1275,7 @@ func applyExpiryOnTransitionedObject(ctx context.Context, objLayer ObjectLayer, 
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			return false
 		}
-		ilmLogIf(ctx, err)
+		ilmLogIf(ctx, fmt.Errorf("expireTransitionedObject(%s, %s): %w", obj.Bucket, obj.Name, err))
 		return false
 	}
 	timeILM(1)
@@ -1296,10 +1325,13 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	dobj, err = objLayer.DeleteObject(ctx, obj.Bucket, encodeDirObject(obj.Name), opts)
 	if err != nil {
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			traceFn(ILMExpiry, nil, nil)
 			return false
 		}
 		// Assume it is still there.
-		ilmLogOnceIf(ctx, err, "non-transition-expiry")
+		err := fmt.Errorf("DeleteObject(%s, %s): %w", obj.Bucket, obj.Name, err)
+		ilmLogOnceIf(ctx, err, "non-transition-expiry"+obj.Name)
+		traceFn(ILMExpiry, nil, err)
 		return false
 	}
 	if dobj.Name == "" {
@@ -1307,6 +1339,8 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	}
 
 	tags := newLifecycleAuditEvent(src, lcEvent).Tags()
+	tags["version-id"] = dobj.VersionID
+
 	// Send audit for the lifecycle delete operation
 	auditLogLifecycle(ctx, dobj, ILMExpiry, tags, traceFn)
 
@@ -1518,7 +1552,7 @@ const (
 	ILMTransition = " ilm:transition"
 )
 
-func auditLogLifecycle(ctx context.Context, oi ObjectInfo, event string, tags map[string]interface{}, traceFn func(event string)) {
+func auditLogLifecycle(ctx context.Context, oi ObjectInfo, event string, tags map[string]string, traceFn func(event string, metadata map[string]string, err error)) {
 	var apiName string
 	switch event {
 	case ILMExpiry:
@@ -1536,5 +1570,5 @@ func auditLogLifecycle(ctx context.Context, oi ObjectInfo, event string, tags ma
 		VersionID: oi.VersionID,
 		Tags:      tags,
 	})
-	traceFn(event)
+	traceFn(event, tags, nil)
 }

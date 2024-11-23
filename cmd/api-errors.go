@@ -28,7 +28,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/minio/minio/internal/ioutil"
 	"google.golang.org/api/googleapi"
 
@@ -444,6 +444,8 @@ const (
 
 	ErrAdminNoAccessKey
 	ErrAdminNoSecretKey
+
+	ErrIAMNotInitialized
 
 	apiErrCodeEnd // This is used only for the testing code
 )
@@ -967,7 +969,7 @@ var errorCodes = errorCodeMap{
 	ErrReplicationRemoteConnectionError: {
 		Code:           "XMinioAdminReplicationRemoteConnectionError",
 		Description:    "Remote service connection error",
-		HTTPStatusCode: http.StatusNotFound,
+		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrReplicationBandwidthLimitError: {
 		Code:           "XMinioAdminReplicationBandwidthLimitError",
@@ -976,7 +978,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrReplicationNoExistingObjects: {
 		Code:           "XMinioReplicationNoExistingObjects",
-		Description:    "No matching ExistingsObjects rule enabled",
+		Description:    "No matching ExistingObjects rule enabled",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrRemoteTargetDenyAddError: {
@@ -1305,6 +1307,11 @@ var errorCodes = errorCodeMap{
 		Description:    "Server not initialized yet, please try again.",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
+	ErrIAMNotInitialized: {
+		Code:           "XMinioIAMNotInitialized",
+		Description:    "IAM sub-system not initialized yet, please try again.",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
 	ErrBucketMetadataNotInitialized: {
 		Code:           "XMinioBucketMetadataNotInitialized",
 		Description:    "Bucket metadata not initialized yet, please try again.",
@@ -1479,7 +1486,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrTooManyRequests: {
 		Code:           "TooManyRequests",
-		Description:    "Deadline exceeded while waiting in incoming queue, please reduce your request rate",
+		Description:    "Please reduce your request rate",
 		HTTPStatusCode: http.StatusTooManyRequests,
 	},
 	ErrUnsupportedMetadata: {
@@ -2542,11 +2549,11 @@ func toAPIError(ctx context.Context, err error) APIError {
 			if len(e.Errors) >= 1 {
 				apiErr.Code = e.Errors[0].Reason
 			}
-		case azblob.StorageError:
+		case *azcore.ResponseError:
 			apiErr = APIError{
-				Code:           string(e.ServiceCode()),
+				Code:           e.ErrorCode,
 				Description:    e.Error(),
-				HTTPStatusCode: e.Response().StatusCode,
+				HTTPStatusCode: e.StatusCode,
 			}
 			// Add more other SDK related errors here if any in future.
 		default:
@@ -2585,7 +2592,7 @@ func getAPIError(code APIErrorCode) APIError {
 	return errorCodes.ToAPIErr(ErrInternalError)
 }
 
-// getErrorResponse gets in standard error and resource value and
+// getAPIErrorResponse gets in standard error and resource value and
 // provides a encodable populated response values
 func getAPIErrorResponse(ctx context.Context, err APIError, resource, requestID, hostID string) APIErrorResponse {
 	reqInfo := logger.GetReqInfo(ctx)

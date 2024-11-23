@@ -54,6 +54,7 @@ const (
 	clusterIAMCollectorPath          collectorPath = "/cluster/iam"
 	clusterConfigCollectorPath       collectorPath = "/cluster/config"
 
+	ilmCollectorPath           collectorPath = "/ilm"
 	auditCollectorPath         collectorPath = "/audit"
 	loggerWebhookCollectorPath collectorPath = "/logger/webhook"
 	replicationCollectorPath   collectorPath = "/replication"
@@ -269,7 +270,7 @@ func newMetricGroups(r *prometheus.Registry) *metricsV3Collection {
 		loadClusterUsageObjectMetrics,
 	)
 
-	clusterUsageBucketsMG := NewBucketMetricsGroup(clusterUsageBucketsCollectorPath,
+	clusterUsageBucketsMG := NewMetricsGroup(clusterUsageBucketsCollectorPath,
 		[]MetricDescriptor{
 			usageSinceLastUpdateSecondsMD,
 			usageBucketTotalBytesMD,
@@ -340,6 +341,7 @@ func newMetricGroups(r *prometheus.Registry) *metricsV3Collection {
 			replicationMaxQueuedBytesMD,
 			replicationMaxQueuedCountMD,
 			replicationMaxDataTransferRateMD,
+			replicationRecentBacklogCountMD,
 		},
 		loadClusterReplicationMetrics,
 	)
@@ -382,6 +384,17 @@ func newMetricGroups(r *prometheus.Registry) *metricsV3Collection {
 		loadAuditMetrics,
 	)
 
+	ilmMG := NewMetricsGroup(ilmCollectorPath,
+		[]MetricDescriptor{
+			ilmExpiryPendingTasksMD,
+			ilmTransitionActiveTasksMD,
+			ilmTransitionPendingTasksMD,
+			ilmTransitionMissedImmediateTasksMD,
+			ilmVersionsScannedMD,
+		},
+		loadILMMetrics,
+	)
+
 	allMetricGroups := []*MetricsGroup{
 		apiRequestsMG,
 		bucketAPIMG,
@@ -402,6 +415,7 @@ func newMetricGroups(r *prometheus.Registry) *metricsV3Collection {
 		clusterReplicationMG,
 		clusterConfigMG,
 
+		ilmMG,
 		scannerMG,
 		auditMG,
 		loggerWebhookMG,

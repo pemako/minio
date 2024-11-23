@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -49,6 +50,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
 	"github.com/tinylib/msgp/msgp"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/exp/maps"
@@ -74,8 +76,9 @@ const (
 	ObjectLockRetentionTimestamp = "objectlock-retention-timestamp"
 	// ObjectLockLegalHoldTimestamp - the last time a legal hold metadata modification happened on this cluster for this object version
 	ObjectLockLegalHoldTimestamp = "objectlock-legalhold-timestamp"
-	// ReplicationWorkerMultiplier is suggested worker multiplier if traffic exceeds replication worker capacity
-	ReplicationWorkerMultiplier = 1.5
+
+	// ReplicationSsecChecksumHeader - the encrypted checksum of the SSE-C encrypted object.
+	ReplicationSsecChecksumHeader = "X-Minio-Replication-Ssec-Crc"
 )
 
 // gets replication config associated to a given bucket name.
@@ -89,7 +92,10 @@ func getReplicationConfig(ctx context.Context, bucketName string) (rc *replicati
 
 // validateReplicationDestination returns error if replication destination bucket missing or not configured
 // It also returns true if replication destination is same as this server.
-func validateReplicationDestination(ctx context.Context, bucket string, rCfg *replication.Config, checkRemote bool) (bool, APIError) {
+func validateReplicationDestination(ctx context.Context, bucket string, rCfg *replication.Config, opts *validateReplicationDestinationOptions) (bool, APIError) {
+	if opts == nil {
+		opts = &validateReplicationDestinationOptions{}
+	}
 	var arns []string
 	if rCfg.RoleArn != "" {
 		arns = append(arns, rCfg.RoleArn)
@@ -111,7 +117,7 @@ func validateReplicationDestination(ctx context.Context, bucket string, rCfg *re
 		if clnt == nil {
 			return sameTarget, toAPIError(ctx, BucketRemoteTargetNotFound{Bucket: bucket})
 		}
-		if checkRemote { // validate remote bucket
+		if opts.CheckRemoteBucket { // validate remote bucket
 			found, err := clnt.BucketExists(ctx, arn.Bucket)
 			if err != nil {
 				return sameTarget, errorCodes.ToAPIErrWithErr(ErrRemoteDestinationNotFoundError, err)
@@ -131,23 +137,29 @@ func validateReplicationDestination(ctx context.Context, bucket string, rCfg *re
 				}
 			}
 		}
+		// if checked bucket, then check the ready is unnecessary
+		if !opts.CheckRemoteBucket && opts.CheckReady {
+			endpoint := clnt.EndpointURL().String()
+			if errInt, ok := opts.checkReadyErr.Load(endpoint); !ok {
+				err = checkRemoteEndpoint(ctx, clnt.EndpointURL())
+				opts.checkReadyErr.Store(endpoint, err)
+			} else {
+				if errInt == nil {
+					err = nil
+				} else {
+					err = errInt.(error)
+				}
+			}
+			switch err.(type) {
+			case BucketRemoteIdenticalToSource:
+				return true, errorCodes.ToAPIErrWithErr(ErrBucketRemoteIdenticalToSource, fmt.Errorf("remote target endpoint %s is self referential", clnt.EndpointURL().String()))
+			default:
+			}
+		}
 		// validate replication ARN against target endpoint
-		c := globalBucketTargetSys.GetRemoteTargetClient(bucket, arnStr)
-		if c != nil {
-			if err := checkRemoteEndpoint(ctx, c.EndpointURL()); err != nil {
-				switch err.(type) {
-				case BucketRemoteIdenticalToSource:
-					return true, errorCodes.ToAPIErrWithErr(ErrBucketRemoteIdenticalToSource, fmt.Errorf("remote target endpoint %s is self referential", c.EndpointURL().String()))
-				default:
-				}
-			}
-			if c.EndpointURL().String() == clnt.EndpointURL().String() {
-				selfTarget, _ := isLocalHost(clnt.EndpointURL().Hostname(), clnt.EndpointURL().Port(), globalMinioPort)
-				if !sameTarget {
-					sameTarget = selfTarget
-				}
-				continue
-			}
+		selfTarget, _ := isLocalHost(clnt.EndpointURL().Hostname(), clnt.EndpointURL().Port(), globalMinioPort)
+		if !sameTarget {
+			sameTarget = selfTarget
 		}
 	}
 
@@ -467,7 +479,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 	lk := objectAPI.NewNSLock(bucket, "/[replicate]/"+dobj.ObjectName)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
-		globalReplicationPool.queueMRFSave(dobj.ToMRFEntry())
+		globalReplicationPool.Get().queueMRFSave(dobj.ToMRFEntry())
 		sendEvent(eventArgs{
 			BucketName: bucket,
 			Object: ObjectInfo{
@@ -537,7 +549,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 	// to decrement pending count later.
 	for _, rinfo := range rinfos.Targets {
 		if rinfo.ReplicationStatus != rinfo.PrevReplicationStatus {
-			globalReplicationStats.Update(dobj.Bucket, rinfo, replicationStatus,
+			globalReplicationStats.Load().Update(dobj.Bucket, rinfo, replicationStatus,
 				prevStatus)
 		}
 	}
@@ -545,7 +557,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 	eventName := event.ObjectReplicationComplete
 	if replicationStatus == replication.Failed {
 		eventName = event.ObjectReplicationFailed
-		globalReplicationPool.queueMRFSave(dobj.ToMRFEntry())
+		globalReplicationPool.Get().queueMRFSave(dobj.ToMRFEntry())
 	}
 	drs := getReplicationState(rinfos, dobj.ReplicationState, dobj.VersionID)
 	if replicationStatus != prevStatus {
@@ -763,11 +775,13 @@ func (m caseInsensitiveMap) Lookup(key string) (string, bool) {
 	return "", false
 }
 
-func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (putOpts minio.PutObjectOptions, err error) {
+func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo, partNum int) (putOpts minio.PutObjectOptions, err error) {
 	meta := make(map[string]string)
+	isSSEC := crypto.SSEC.IsEncrypted(objInfo.UserDefined)
+
 	for k, v := range objInfo.UserDefined {
 		// In case of SSE-C objects copy the allowed internal headers as well
-		if !crypto.SSEC.IsEncrypted(objInfo.UserDefined) || !slices.Contains(maps.Keys(validSSEReplicationHeaders), k) {
+		if !isSSEC || !slices.Contains(maps.Keys(validSSEReplicationHeaders), k) {
 			if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 				continue
 			}
@@ -779,6 +793,21 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (put
 			meta[validSSEReplicationHeaders[k]] = v
 		} else {
 			meta[k] = v
+		}
+	}
+
+	if len(objInfo.Checksum) > 0 {
+		// Add encrypted CRC to metadata for SSE-C objects.
+		if isSSEC {
+			meta[ReplicationSsecChecksumHeader] = base64.StdEncoding.EncodeToString(objInfo.Checksum)
+		} else {
+			for _, pi := range objInfo.Parts {
+				if pi.Number == partNum {
+					for k, v := range pi.Checksums {
+						meta[k] = v
+					}
+				}
+			}
 		}
 	}
 
@@ -859,6 +888,14 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (put
 	}
 	if crypto.S3.IsEncrypted(objInfo.UserDefined) {
 		putOpts.ServerSideEncryption = encrypt.NewSSE()
+	}
+
+	if crypto.S3KMS.IsEncrypted(objInfo.UserDefined) {
+		sseEnc, err := encrypt.NewSSEKMS(objInfo.KMSKeyID(), nil)
+		if err != nil {
+			return putOpts, err
+		}
+		putOpts.ServerSideEncryption = sseEnc
 	}
 	return
 }
@@ -1026,7 +1063,7 @@ func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI Obje
 			UserAgent:  "Internal: [Replication]",
 			Host:       globalLocalNodeName,
 		})
-		globalReplicationPool.queueMRFSave(ri.ToMRFEntry())
+		globalReplicationPool.Get().queueMRFSave(ri.ToMRFEntry())
 		return
 	}
 	ctx = lkctx.Context()
@@ -1111,7 +1148,7 @@ func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI Obje
 		for _, rinfo := range rinfos.Targets {
 			if rinfo.ReplicationStatus != rinfo.PrevReplicationStatus {
 				rinfo.OpType = opType // update optype to reflect correct operation.
-				globalReplicationStats.Update(bucket, rinfo, rinfo.ReplicationStatus, rinfo.PrevReplicationStatus)
+				globalReplicationStats.Load().Update(bucket, rinfo, rinfo.ReplicationStatus, rinfo.PrevReplicationStatus)
 			}
 		}
 	}
@@ -1131,7 +1168,7 @@ func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI Obje
 		ri.EventType = ReplicateMRF
 		ri.ReplicationStatusInternal = rinfos.ReplicationStatusInternal()
 		ri.RetryCount++
-		globalReplicationPool.queueMRFSave(ri.ToMRFEntry())
+		globalReplicationPool.Get().queueMRFSave(ri.ToMRFEntry())
 	}
 }
 
@@ -1201,17 +1238,23 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 	// make sure we have the latest metadata for metrics calculation
 	rinfo.PrevReplicationStatus = objInfo.TargetReplicationStatus(tgt.ARN)
 
-	size, err := objInfo.GetActualSize()
-	if err != nil {
-		replLogIf(ctx, err)
-		sendEvent(eventArgs{
-			EventName:  event.ObjectReplicationNotTracked,
-			BucketName: bucket,
-			Object:     objInfo,
-			UserAgent:  "Internal: [Replication]",
-			Host:       globalLocalNodeName,
-		})
-		return
+	// Set the encrypted size for SSE-C objects
+	var size int64
+	if crypto.SSEC.IsEncrypted(objInfo.UserDefined) {
+		size = objInfo.Size
+	} else {
+		size, err = objInfo.GetActualSize()
+		if err != nil {
+			replLogIf(ctx, err)
+			sendEvent(eventArgs{
+				EventName:  event.ObjectReplicationNotTracked,
+				BucketName: bucket,
+				Object:     objInfo,
+				UserAgent:  "Internal: [Replication]",
+				Host:       globalLocalNodeName,
+			})
+			return
+		}
 	}
 
 	if tgt.Bucket == "" {
@@ -1239,7 +1282,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 	// use core client to avoid doing multipart on PUT
 	c := &minio.Core{Client: tgt.Client}
 
-	putOpts, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo)
+	putOpts, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo, 0)
 	if err != nil {
 		replLogIf(ctx, fmt.Errorf("failure setting options for replication bucket:%s err:%w", bucket, err))
 		sendEvent(eventArgs{
@@ -1265,7 +1308,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 		HeaderSize: headerSize,
 	}
 	newCtx := ctx
-	if globalBucketMonitor.IsThrottled(bucket, tgt.ARN) {
+	if globalBucketMonitor.IsThrottled(bucket, tgt.ARN) && objInfo.Size < minLargeObjSize {
 		var cancel context.CancelFunc
 		newCtx, cancel = context.WithTimeout(ctx, throttleDeadline)
 		defer cancel()
@@ -1377,7 +1420,8 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 	}
 
 	// Set the encrypted size for SSE-C objects
-	if crypto.SSEC.IsEncrypted(objInfo.UserDefined) {
+	isSSEC := crypto.SSEC.IsEncrypted(objInfo.UserDefined)
+	if isSSEC {
 		size = objInfo.Size
 	}
 
@@ -1437,6 +1481,13 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 			return
 		}
 	} else {
+		// SSEC objects will refuse HeadObject without the decryption key.
+		// Ignore the error, since we know the object exists and versioning prevents overwriting existing versions.
+		if isSSEC && strings.Contains(cerr.Error(), errorCodes[ErrSSEEncryptedObject].Description) {
+			rinfo.ReplicationStatus = replication.Completed
+			rinfo.ReplicationAction = replicateNone
+			goto applyAction
+		}
 		// if target returns error other than NoSuchKey, defer replication attempt
 		if minio.IsNetworkOrHostDown(cerr, true) && !globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
 			globalBucketTargetSys.markOffline(tgt.EndpointURL())
@@ -1464,6 +1515,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 			return
 		}
 	}
+applyAction:
 	rinfo.ReplicationStatus = replication.Completed
 	rinfo.Size = size
 	rinfo.ReplicationAction = rAction
@@ -1506,7 +1558,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 		}
 	} else {
 		var putOpts minio.PutObjectOptions
-		putOpts, err = putReplicationOpts(ctx, tgt.StorageClass, objInfo)
+		putOpts, err = putReplicationOpts(ctx, tgt.StorageClass, objInfo, 0)
 		if err != nil {
 			replLogIf(ctx, fmt.Errorf("failed to set replicate options for object %s/%s(%s) (target %s) err:%w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), err))
 			sendEvent(eventArgs{
@@ -1531,7 +1583,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 			HeaderSize: headerSize,
 		}
 		newCtx := ctx
-		if globalBucketMonitor.IsThrottled(bucket, tgt.ARN) {
+		if globalBucketMonitor.IsThrottled(bucket, tgt.ARN) && objInfo.Size < minLargeObjSize {
 			var cancel context.CancelFunc
 			newCtx, cancel = context.WithTimeout(ctx, throttleDeadline)
 			defer cancel()
@@ -1597,13 +1649,13 @@ func replicateObjectWithMultipart(ctx context.Context, c *minio.Core, bucket, ob
 	}()
 
 	var (
-		hr    *hash.Reader
-		pInfo minio.ObjectPart
+		hr     *hash.Reader
+		isSSEC = crypto.SSEC.IsEncrypted(objInfo.UserDefined)
 	)
 
 	var objectSize int64
 	for _, partInfo := range objInfo.Parts {
-		if crypto.SSEC.IsEncrypted(objInfo.UserDefined) {
+		if isSSEC {
 			hr, err = hash.NewReader(ctx, io.LimitReader(r, partInfo.Size), partInfo.Size, "", "", partInfo.ActualSize)
 		} else {
 			hr, err = hash.NewReader(ctx, io.LimitReader(r, partInfo.ActualSize), partInfo.ActualSize, "", "", partInfo.ActualSize)
@@ -1614,35 +1666,51 @@ func replicateObjectWithMultipart(ctx context.Context, c *minio.Core, bucket, ob
 
 		cHeader := http.Header{}
 		cHeader.Add(xhttp.MinIOSourceReplicationRequest, "true")
+		if !isSSEC {
+			for k, v := range partInfo.Checksums {
+				cHeader.Add(k, v)
+			}
+		}
 		popts := minio.PutObjectPartOptions{
 			SSE:          opts.ServerSideEncryption,
 			CustomHeader: cHeader,
 		}
 
-		if crypto.SSEC.IsEncrypted(objInfo.UserDefined) {
-			objectSize += partInfo.Size
-			pInfo, err = c.PutObjectPart(ctx, bucket, object, uploadID, partInfo.Number, hr, partInfo.Size, popts)
+		var size int64
+		if isSSEC {
+			size = partInfo.Size
 		} else {
-			objectSize += partInfo.ActualSize
-			pInfo, err = c.PutObjectPart(ctx, bucket, object, uploadID, partInfo.Number, hr, partInfo.ActualSize, popts)
+			size = partInfo.ActualSize
 		}
+		objectSize += size
+		pInfo, err := c.PutObjectPart(ctx, bucket, object, uploadID, partInfo.Number, hr, size, popts)
 		if err != nil {
 			return err
 		}
-		if !crypto.SSEC.IsEncrypted(objInfo.UserDefined) && pInfo.Size != partInfo.ActualSize {
-			return fmt.Errorf("Part size mismatch: got %d, want %d", pInfo.Size, partInfo.ActualSize)
+		if pInfo.Size != size {
+			return fmt.Errorf("ssec(%t): Part size mismatch: got %d, want %d", isSSEC, pInfo.Size, size)
 		}
 		uploadedParts = append(uploadedParts, minio.CompletePart{
-			PartNumber: pInfo.PartNumber,
-			ETag:       pInfo.ETag,
+			PartNumber:     pInfo.PartNumber,
+			ETag:           pInfo.ETag,
+			ChecksumCRC32:  pInfo.ChecksumCRC32,
+			ChecksumCRC32C: pInfo.ChecksumCRC32C,
+			ChecksumSHA1:   pInfo.ChecksumSHA1,
+			ChecksumSHA256: pInfo.ChecksumSHA256,
 		})
+	}
+	userMeta := map[string]string{
+		xhttp.MinIOReplicationActualObjectSize: objInfo.UserDefined[ReservedMetadataPrefix+"actual-size"],
+	}
+	if isSSEC && objInfo.UserDefined[ReplicationSsecChecksumHeader] != "" {
+		userMeta[ReplicationSsecChecksumHeader] = objInfo.UserDefined[ReplicationSsecChecksumHeader]
 	}
 
 	// really big value but its okay on heavily loaded systems. This is just tail end timeout.
 	cctx, ccancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer ccancel()
 	_, err = c.CompleteMultipartUpload(cctx, bucket, object, uploadID, uploadedParts, minio.PutObjectOptions{
-		UserMetadata: map[string]string{validSSEReplicationHeaders[ReservedMetadataPrefix+"Actual-Object-Size"]: objInfo.UserDefined[ReservedMetadataPrefix+"actual-size"]},
+		UserMetadata: userMeta,
 		Internal: minio.AdvancedPutOptions{
 			SourceMTime: objInfo.ModTime,
 			SourceETag:  objInfo.ETag,
@@ -1728,23 +1796,27 @@ const (
 )
 
 var (
-	globalReplicationPool  *ReplicationPool
-	globalReplicationStats *ReplicationStats
+	globalReplicationPool  = once.NewSingleton[ReplicationPool]()
+	globalReplicationStats atomic.Pointer[ReplicationStats]
 )
 
 // ReplicationPool describes replication pool
 type ReplicationPool struct {
 	// atomic ops:
 	activeWorkers    int32
+	activeLrgWorkers int32
 	activeMRFWorkers int32
 
-	objLayer   ObjectLayer
-	ctx        context.Context
-	priority   string
-	maxWorkers int
-	mu         sync.RWMutex
-	mrfMU      sync.Mutex
-	resyncer   *replicationResyncer
+	objLayer    ObjectLayer
+	ctx         context.Context
+	priority    string
+	maxWorkers  int
+	maxLWorkers int
+	stats       *ReplicationStats
+
+	mu       sync.RWMutex
+	mrfMU    sync.Mutex
+	resyncer *replicationResyncer
 
 	// workers:
 	workers    []chan ReplicationWorkerOperation
@@ -1787,7 +1859,7 @@ const (
 )
 
 // NewReplicationPool creates a pool of replication workers of specified size
-func NewReplicationPool(ctx context.Context, o ObjectLayer, opts replicationPoolOpts) *ReplicationPool {
+func NewReplicationPool(ctx context.Context, o ObjectLayer, opts replicationPoolOpts, stats *ReplicationStats) *ReplicationPool {
 	var workers, failedWorkers int
 	priority := "auto"
 	maxWorkers := WorkerMaxLimit
@@ -1815,9 +1887,13 @@ func NewReplicationPool(ctx context.Context, o ObjectLayer, opts replicationPool
 	if maxWorkers > 0 && failedWorkers > maxWorkers {
 		failedWorkers = maxWorkers
 	}
+	maxLWorkers := LargeWorkerCount
+	if opts.MaxLWorkers > 0 {
+		maxLWorkers = opts.MaxLWorkers
+	}
 	pool := &ReplicationPool{
 		workers:         make([]chan ReplicationWorkerOperation, 0, workers),
-		lrgworkers:      make([]chan ReplicationWorkerOperation, 0, LargeWorkerCount),
+		lrgworkers:      make([]chan ReplicationWorkerOperation, 0, maxLWorkers),
 		mrfReplicaCh:    make(chan ReplicationWorkerOperation, 100000),
 		mrfWorkerKillCh: make(chan struct{}, failedWorkers),
 		resyncer:        newresyncer(),
@@ -1825,11 +1901,13 @@ func NewReplicationPool(ctx context.Context, o ObjectLayer, opts replicationPool
 		mrfStopCh:       make(chan struct{}, 1),
 		ctx:             ctx,
 		objLayer:        o,
+		stats:           stats,
 		priority:        priority,
 		maxWorkers:      maxWorkers,
+		maxLWorkers:     maxLWorkers,
 	}
 
-	pool.AddLargeWorkers()
+	pool.ResizeLrgWorkers(maxLWorkers, 0)
 	pool.ResizeWorkers(workers, 0)
 	pool.ResizeFailedWorkers(failedWorkers)
 	go pool.resyncer.PersistToDisk(ctx, o)
@@ -1851,11 +1929,11 @@ func (p *ReplicationPool) AddMRFWorker() {
 			}
 			switch v := oi.(type) {
 			case ReplicateObjectInfo:
-				globalReplicationStats.incQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
+				p.stats.incQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
 				atomic.AddInt32(&p.activeMRFWorkers, 1)
 				replicateObject(p.ctx, v, p.objLayer)
 				atomic.AddInt32(&p.activeMRFWorkers, -1)
-				globalReplicationStats.decQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
+				p.stats.decQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
 
 			default:
 				bugLogIf(p.ctx, fmt.Errorf("unknown mrf replication type: %T", oi), "unknown-mrf-replicate-type")
@@ -1883,9 +1961,9 @@ func (p *ReplicationPool) AddWorker(input <-chan ReplicationWorkerOperation, opT
 				if opTracker != nil {
 					atomic.AddInt32(opTracker, 1)
 				}
-				globalReplicationStats.incQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
+				p.stats.incQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
 				replicateObject(p.ctx, v, p.objLayer)
-				globalReplicationStats.decQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
+				p.stats.decQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
 				if opTracker != nil {
 					atomic.AddInt32(opTracker, -1)
 				}
@@ -1893,10 +1971,10 @@ func (p *ReplicationPool) AddWorker(input <-chan ReplicationWorkerOperation, opT
 				if opTracker != nil {
 					atomic.AddInt32(opTracker, 1)
 				}
-				globalReplicationStats.incQ(v.Bucket, 0, true, v.OpType)
+				p.stats.incQ(v.Bucket, 0, true, v.OpType)
 
 				replicateDelete(p.ctx, v, p.objLayer)
-				globalReplicationStats.decQ(v.Bucket, 0, true, v.OpType)
+				p.stats.decQ(v.Bucket, 0, true, v.OpType)
 
 				if opTracker != nil {
 					atomic.AddInt32(opTracker, -1)
@@ -1908,23 +1986,8 @@ func (p *ReplicationPool) AddWorker(input <-chan ReplicationWorkerOperation, opT
 	}
 }
 
-// AddLargeWorkers adds a static number of workers to handle large uploads
-func (p *ReplicationPool) AddLargeWorkers() {
-	for i := 0; i < LargeWorkerCount; i++ {
-		p.lrgworkers = append(p.lrgworkers, make(chan ReplicationWorkerOperation, 100000))
-		i := i
-		go p.AddLargeWorker(p.lrgworkers[i])
-	}
-	go func() {
-		<-p.ctx.Done()
-		for i := 0; i < LargeWorkerCount; i++ {
-			xioutil.SafeClose(p.lrgworkers[i])
-		}
-	}()
-}
-
 // AddLargeWorker adds a replication worker to the static pool for large uploads.
-func (p *ReplicationPool) AddLargeWorker(input <-chan ReplicationWorkerOperation) {
+func (p *ReplicationPool) AddLargeWorker(input <-chan ReplicationWorkerOperation, opTracker *int32) {
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -1935,15 +1998,51 @@ func (p *ReplicationPool) AddLargeWorker(input <-chan ReplicationWorkerOperation
 			}
 			switch v := oi.(type) {
 			case ReplicateObjectInfo:
-				globalReplicationStats.incQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
+				if opTracker != nil {
+					atomic.AddInt32(opTracker, 1)
+				}
+				p.stats.incQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
 				replicateObject(p.ctx, v, p.objLayer)
-				globalReplicationStats.decQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
+				p.stats.decQ(v.Bucket, v.Size, v.DeleteMarker, v.OpType)
+				if opTracker != nil {
+					atomic.AddInt32(opTracker, -1)
+				}
 			case DeletedObjectReplicationInfo:
+				if opTracker != nil {
+					atomic.AddInt32(opTracker, 1)
+				}
 				replicateDelete(p.ctx, v, p.objLayer)
+				if opTracker != nil {
+					atomic.AddInt32(opTracker, -1)
+				}
 			default:
 				bugLogIf(p.ctx, fmt.Errorf("unknown replication type: %T", oi), "unknown-replicate-type")
 			}
 		}
+	}
+}
+
+// ResizeLrgWorkers sets replication workers pool for large transfers(>=128MiB) to new size.
+// checkOld can be set to an expected value.
+// If the worker count changed
+func (p *ReplicationPool) ResizeLrgWorkers(n, checkOld int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if (checkOld > 0 && len(p.lrgworkers) != checkOld) || n == len(p.lrgworkers) || n < 1 {
+		// Either already satisfied or worker count changed while we waited for the lock.
+		return
+	}
+	for len(p.lrgworkers) < n {
+		input := make(chan ReplicationWorkerOperation, 100000)
+		p.lrgworkers = append(p.lrgworkers, input)
+
+		go p.AddLargeWorker(input, &p.activeLrgWorkers)
+	}
+	for len(p.lrgworkers) > n {
+		worker := p.lrgworkers[len(p.lrgworkers)-1]
+		p.lrgworkers = p.lrgworkers[:len(p.lrgworkers)-1]
+		xioutil.SafeClose(worker)
 	}
 }
 
@@ -1955,6 +2054,11 @@ func (p *ReplicationPool) ActiveWorkers() int {
 // ActiveMRFWorkers returns the number of active workers handling replication failures.
 func (p *ReplicationPool) ActiveMRFWorkers() int {
 	return int(atomic.LoadInt32(&p.activeMRFWorkers))
+}
+
+// ActiveLrgWorkers returns the number of active workers handling traffic > 128MiB object size.
+func (p *ReplicationPool) ActiveLrgWorkers() int {
+	return int(atomic.LoadInt32(&p.activeLrgWorkers))
 }
 
 // ResizeWorkers sets replication workers pool to new size.
@@ -1982,7 +2086,7 @@ func (p *ReplicationPool) ResizeWorkers(n, checkOld int) {
 }
 
 // ResizeWorkerPriority sets replication failed workers pool size
-func (p *ReplicationPool) ResizeWorkerPriority(pri string, maxWorkers int) {
+func (p *ReplicationPool) ResizeWorkerPriority(pri string, maxWorkers, maxLWorkers int) {
 	var workers, mrfWorkers int
 	p.mu.Lock()
 	switch pri {
@@ -2009,11 +2113,15 @@ func (p *ReplicationPool) ResizeWorkerPriority(pri string, maxWorkers int) {
 	if maxWorkers > 0 && mrfWorkers > maxWorkers {
 		mrfWorkers = maxWorkers
 	}
+	if maxLWorkers <= 0 {
+		maxLWorkers = LargeWorkerCount
+	}
 	p.priority = pri
 	p.maxWorkers = maxWorkers
 	p.mu.Unlock()
 	p.ResizeWorkers(workers, 0)
 	p.ResizeFailedWorkers(mrfWorkers)
+	p.ResizeLrgWorkers(maxLWorkers, 0)
 }
 
 // ResizeFailedWorkers sets replication failed workers pool size
@@ -2057,9 +2165,18 @@ func (p *ReplicationPool) queueReplicaTask(ri ReplicateObjectInfo) {
 		h := xxh3.HashString(ri.Bucket + ri.Name)
 		select {
 		case <-p.ctx.Done():
-		case p.lrgworkers[h%LargeWorkerCount] <- ri:
+		case p.lrgworkers[h%uint64(len(p.lrgworkers))] <- ri:
 		default:
-			globalReplicationPool.queueMRFSave(ri.ToMRFEntry())
+			p.queueMRFSave(ri.ToMRFEntry())
+			p.mu.RLock()
+			maxLWorkers := p.maxLWorkers
+			existing := len(p.lrgworkers)
+			p.mu.RUnlock()
+			maxLWorkers = min(maxLWorkers, LargeWorkerCount)
+			if p.ActiveLrgWorkers() < maxLWorkers {
+				workers := min(existing+1, maxLWorkers)
+				p.ResizeLrgWorkers(workers, existing)
+			}
 		}
 		return
 	}
@@ -2081,7 +2198,7 @@ func (p *ReplicationPool) queueReplicaTask(ri ReplicateObjectInfo) {
 	case healCh <- ri:
 	case ch <- ri:
 	default:
-		globalReplicationPool.queueMRFSave(ri.ToMRFEntry())
+		globalReplicationPool.Get().queueMRFSave(ri.ToMRFEntry())
 		p.mu.RLock()
 		prio := p.priority
 		maxWorkers := p.maxWorkers
@@ -2117,7 +2234,7 @@ func queueReplicateDeletesWrapper(doi DeletedObjectReplicationInfo, existingObje
 			doi.ResetID = v.ResetID
 			doi.TargetArn = k
 
-			globalReplicationPool.queueReplicaDeleteTask(doi)
+			globalReplicationPool.Get().queueReplicaDeleteTask(doi)
 		}
 	}
 }
@@ -2138,7 +2255,7 @@ func (p *ReplicationPool) queueReplicaDeleteTask(doi DeletedObjectReplicationInf
 	case <-p.ctx.Done():
 	case ch <- doi:
 	default:
-		globalReplicationPool.queueMRFSave(doi.ToMRFEntry())
+		p.queueMRFSave(doi.ToMRFEntry())
 		p.mu.RLock()
 		prio := p.priority
 		maxWorkers := p.maxWorkers
@@ -2162,14 +2279,16 @@ func (p *ReplicationPool) queueReplicaDeleteTask(doi DeletedObjectReplicationInf
 }
 
 type replicationPoolOpts struct {
-	Priority   string
-	MaxWorkers int
+	Priority    string
+	MaxWorkers  int
+	MaxLWorkers int
 }
 
 func initBackgroundReplication(ctx context.Context, objectAPI ObjectLayer) {
-	globalReplicationPool = NewReplicationPool(ctx, objectAPI, globalAPIConfig.getReplicationOpts())
-	globalReplicationStats = NewReplicationStats(ctx, objectAPI)
-	go globalReplicationStats.trackEWMA()
+	stats := NewReplicationStats(ctx, objectAPI)
+	globalReplicationPool.Set(NewReplicationPool(ctx, objectAPI, globalAPIConfig.getReplicationOpts(), stats))
+	globalReplicationStats.Store(stats)
+	go stats.trackEWMA()
 }
 
 type proxyResult struct {
@@ -2179,12 +2298,12 @@ type proxyResult struct {
 
 // get Reader from replication target if active-active replication is in place and
 // this node returns a 404
-func proxyGetToReplicationTarget(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, _ http.Header, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (gr *GetObjectReader, proxy proxyResult, err error) {
+func proxyGetToReplicationTarget(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (gr *GetObjectReader, proxy proxyResult, err error) {
 	tgt, oi, proxy := proxyHeadToRepTarget(ctx, bucket, object, rs, opts, proxyTargets)
 	if !proxy.Proxy {
 		return nil, proxy, nil
 	}
-	fn, _, _, err := NewGetObjectReader(nil, oi, opts)
+	fn, _, _, err := NewGetObjectReader(nil, oi, opts, h)
 	if err != nil {
 		return nil, proxy, err
 	}
@@ -2369,11 +2488,13 @@ func scheduleReplication(ctx context.Context, oi ObjectInfo, o ObjectLayer, dsc 
 		SSEC:                 crypto.SSEC.IsEncrypted(oi.UserDefined),
 		UserTags:             oi.UserTags,
 	}
-
+	if ri.SSEC {
+		ri.Checksum = oi.Checksum
+	}
 	if dsc.Synchronous() {
 		replicateObject(ctx, ri, o)
 	} else {
-		globalReplicationPool.queueReplicaTask(ri)
+		globalReplicationPool.Get().queueReplicaTask(ri)
 	}
 }
 
@@ -2501,9 +2622,9 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 }
 
 func scheduleReplicationDelete(ctx context.Context, dv DeletedObjectReplicationInfo, o ObjectLayer) {
-	globalReplicationPool.queueReplicaDeleteTask(dv)
+	globalReplicationPool.Get().queueReplicaDeleteTask(dv)
 	for arn := range dv.ReplicationState.Targets {
-		globalReplicationStats.Update(dv.Bucket, replicatedTargetInfo{Arn: arn, Size: 0, Duration: 0, OpType: replication.DeleteReplicationType}, replication.Pending, replication.StatusType(""))
+		globalReplicationStats.Load().Update(dv.Bucket, replicatedTargetInfo{Arn: arn, Size: 0, Duration: 0, OpType: replication.DeleteReplicationType}, replication.Pending, replication.StatusType(""))
 	}
 }
 
@@ -2849,17 +2970,19 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 						ReplicationProxyRequest: "false",
 					},
 				})
+				sz := roi.Size
 				if err != nil {
 					if roi.DeleteMarker && isErrMethodNotAllowed(ErrorRespToObjectError(err, opts.bucket, roi.Name)) {
 						st.ReplicatedCount++
 					} else {
 						st.FailedCount++
 					}
+					sz = 0
 				} else {
 					st.ReplicatedCount++
 					st.ReplicatedSize += roi.Size
 				}
-				traceFn(err)
+				traceFn(sz, err)
 				select {
 				case <-ctx.Done():
 					return
@@ -2931,9 +3054,9 @@ func (s *replicationResyncer) start(ctx context.Context, objAPI ObjectLayer, opt
 	if len(tgtArns) == 0 {
 		return fmt.Errorf("arn %s specified for resync not found in replication config", opts.arn)
 	}
-	globalReplicationPool.resyncer.RLock()
-	data, ok := globalReplicationPool.resyncer.statusMap[opts.bucket]
-	globalReplicationPool.resyncer.RUnlock()
+	globalReplicationPool.Get().resyncer.RLock()
+	data, ok := globalReplicationPool.Get().resyncer.statusMap[opts.bucket]
+	globalReplicationPool.Get().resyncer.RUnlock()
 	if !ok {
 		data, err = loadBucketResyncMetadata(ctx, opts.bucket, objAPI)
 		if err != nil {
@@ -2959,9 +3082,9 @@ func (s *replicationResyncer) start(ctx context.Context, objAPI ObjectLayer, opt
 		return err
 	}
 
-	globalReplicationPool.resyncer.Lock()
-	defer globalReplicationPool.resyncer.Unlock()
-	brs, ok := globalReplicationPool.resyncer.statusMap[opts.bucket]
+	globalReplicationPool.Get().resyncer.Lock()
+	defer globalReplicationPool.Get().resyncer.Unlock()
+	brs, ok := globalReplicationPool.Get().resyncer.statusMap[opts.bucket]
 	if !ok {
 		brs = BucketReplicationResyncStatus{
 			Version:    resyncMetaVersion,
@@ -2969,22 +3092,22 @@ func (s *replicationResyncer) start(ctx context.Context, objAPI ObjectLayer, opt
 		}
 	}
 	brs.TargetsMap[opts.arn] = status
-	globalReplicationPool.resyncer.statusMap[opts.bucket] = brs
-	go globalReplicationPool.resyncer.resyncBucket(GlobalContext, objAPI, false, opts)
+	globalReplicationPool.Get().resyncer.statusMap[opts.bucket] = brs
+	go globalReplicationPool.Get().resyncer.resyncBucket(GlobalContext, objAPI, false, opts)
 	return nil
 }
 
-func (s *replicationResyncer) trace(resyncID string, path string) func(err error) {
+func (s *replicationResyncer) trace(resyncID string, path string) func(sz int64, err error) {
 	startTime := time.Now()
-	return func(err error) {
+	return func(sz int64, err error) {
 		duration := time.Since(startTime)
 		if globalTrace.NumSubscribers(madmin.TraceReplicationResync) > 0 {
-			globalTrace.Publish(replicationResyncTrace(resyncID, startTime, duration, path, err))
+			globalTrace.Publish(replicationResyncTrace(resyncID, startTime, duration, path, err, sz))
 		}
 	}
 }
 
-func replicationResyncTrace(resyncID string, startTime time.Time, duration time.Duration, path string, err error) madmin.TraceInfo {
+func replicationResyncTrace(resyncID string, startTime time.Time, duration time.Duration, path string, err error, sz int64) madmin.TraceInfo {
 	var errStr string
 	if err != nil {
 		errStr = err.Error()
@@ -2998,6 +3121,7 @@ func replicationResyncTrace(resyncID string, startTime time.Time, duration time.
 		Duration:  duration,
 		Path:      path,
 		Error:     errStr,
+		Bytes:     sz,
 	}
 }
 
@@ -3014,7 +3138,7 @@ func (p *ReplicationPool) deleteResyncMetadata(ctx context.Context, bucket strin
 }
 
 // initResync - initializes bucket replication resync for all buckets.
-func (p *ReplicationPool) initResync(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) error {
+func (p *ReplicationPool) initResync(ctx context.Context, buckets []string, objAPI ObjectLayer) error {
 	if objAPI == nil {
 		return errServerNotInitialized
 	}
@@ -3023,7 +3147,7 @@ func (p *ReplicationPool) initResync(ctx context.Context, buckets []BucketInfo, 
 	return nil
 }
 
-func (p *ReplicationPool) startResyncRoutine(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) {
+func (p *ReplicationPool) startResyncRoutine(ctx context.Context, buckets []string, objAPI ObjectLayer) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	// Run the replication resync in a loop
 	for {
@@ -3041,13 +3165,13 @@ func (p *ReplicationPool) startResyncRoutine(ctx context.Context, buckets []Buck
 }
 
 // Loads bucket replication resync statuses into memory.
-func (p *ReplicationPool) loadResync(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) error {
+func (p *ReplicationPool) loadResync(ctx context.Context, buckets []string, objAPI ObjectLayer) error {
 	// Make sure only one node running resync on the cluster.
 	ctx, cancel := globalLeaderLock.GetLock(ctx)
 	defer cancel()
 
 	for index := range buckets {
-		bucket := buckets[index].Name
+		bucket := buckets[index]
 
 		meta, err := loadBucketResyncMetadata(ctx, bucket, objAPI)
 		if err != nil {
@@ -3301,7 +3425,7 @@ func queueReplicationHeal(ctx context.Context, bucket string, oi ObjectInfo, rcf
 		if roi.ReplicationStatus == replication.Pending ||
 			roi.ReplicationStatus == replication.Failed ||
 			roi.VersionPurgeStatus == Failed || roi.VersionPurgeStatus == Pending {
-			globalReplicationPool.queueReplicaDeleteTask(dv)
+			globalReplicationPool.Get().queueReplicaDeleteTask(dv)
 			return
 		}
 		// if replication status is Complete on DeleteMarker and existing object resync required
@@ -3317,12 +3441,12 @@ func queueReplicationHeal(ctx context.Context, bucket string, oi ObjectInfo, rcf
 	switch roi.ReplicationStatus {
 	case replication.Pending, replication.Failed:
 		roi.EventType = ReplicateHeal
-		globalReplicationPool.queueReplicaTask(roi)
+		globalReplicationPool.Get().queueReplicaTask(roi)
 		return
 	}
 	if roi.ExistingObjResync.mustResync() {
 		roi.EventType = ReplicateExisting
-		globalReplicationPool.queueReplicaTask(roi)
+		globalReplicationPool.Get().queueReplicaTask(roi)
 	}
 	return
 }
@@ -3387,8 +3511,8 @@ func (p *ReplicationPool) queueMRFSave(entry MRFReplicateEntry) {
 		return
 	}
 	if entry.RetryCount > mrfRetryLimit { // let scanner catch up if retry count exceeded
-		atomic.AddUint64(&globalReplicationStats.mrfStats.TotalDroppedCount, 1)
-		atomic.AddUint64(&globalReplicationStats.mrfStats.TotalDroppedBytes, uint64(entry.sz))
+		atomic.AddUint64(&p.stats.mrfStats.TotalDroppedCount, 1)
+		atomic.AddUint64(&p.stats.mrfStats.TotalDroppedBytes, uint64(entry.sz))
 		return
 	}
 
@@ -3401,8 +3525,8 @@ func (p *ReplicationPool) queueMRFSave(entry MRFReplicateEntry) {
 		select {
 		case p.mrfSaveCh <- entry:
 		default:
-			atomic.AddUint64(&globalReplicationStats.mrfStats.TotalDroppedCount, 1)
-			atomic.AddUint64(&globalReplicationStats.mrfStats.TotalDroppedBytes, uint64(entry.sz))
+			atomic.AddUint64(&p.stats.mrfStats.TotalDroppedCount, 1)
+			atomic.AddUint64(&p.stats.mrfStats.TotalDroppedBytes, uint64(entry.sz))
 		}
 	}
 }
@@ -3433,7 +3557,7 @@ func (p *ReplicationPool) persistToDrive(ctx context.Context, v MRFReplicateEntr
 	}
 
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	for _, localDrive := range localDrives {
@@ -3451,7 +3575,7 @@ func (p *ReplicationPool) saveMRFEntries(ctx context.Context, entries map[string
 	if !p.initialized() {
 		return
 	}
-	atomic.StoreUint64(&globalReplicationStats.mrfStats.LastFailedCount, uint64(len(entries)))
+	atomic.StoreUint64(&p.stats.mrfStats.LastFailedCount, uint64(len(entries)))
 	if len(entries) == 0 {
 		return
 	}
@@ -3500,7 +3624,7 @@ func (p *ReplicationPool) loadMRF() (mrfRec MRFReplicateEntries, err error) {
 	}
 
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	for _, localDrive := range localDrives {
@@ -3620,4 +3744,13 @@ func (p *ReplicationPool) getMRF(ctx context.Context, bucket string) (ch <-chan 
 	}()
 
 	return mrfCh, nil
+}
+
+// validateReplicationDestinationOptions is used to configure the validation of the replication destination.
+// validateReplicationDestination uses this to configure the validation.
+type validateReplicationDestinationOptions struct {
+	CheckRemoteBucket bool
+	CheckReady        bool
+
+	checkReadyErr sync.Map
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2023 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -358,7 +358,7 @@ func (p *poolMeta) validate(pools []*erasureSets) (bool, error) {
 			update = true
 		}
 		if ok && pi.completed {
-			return false, fmt.Errorf("pool(%s) = %s is decommissioned, please remove from server command line", humanize.Ordinal(pi.position+1), k)
+			logger.LogIf(GlobalContext, "decommission", fmt.Errorf("pool(%s) = %s is decommissioned, please remove from server command line", humanize.Ordinal(pi.position+1), k))
 		}
 	}
 
@@ -490,13 +490,10 @@ const (
 // in 'pool.bin', this is eventually used for decommissioning the pool.
 func (z *erasureServerPools) Init(ctx context.Context) error {
 	// Load rebalance metadata if present
-	err := z.loadRebalanceMeta(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to load rebalance data: %w", err)
+	if err := z.loadRebalanceMeta(ctx); err == nil {
+		// Start rebalance routine if we can reload rebalance metadata.
+		z.StartRebalance()
 	}
-
-	// Start rebalance routine
-	z.StartRebalance()
 
 	meta := poolMeta{}
 	if err := meta.load(ctx, z.serverPools[0], z.serverPools); err != nil {
@@ -608,7 +605,7 @@ func (z *erasureServerPools) IsDecommissionRunning() bool {
 	return false
 }
 
-func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket string, gr *GetObjectReader) (err error) {
+func (z *erasureServerPools) decommissionObject(ctx context.Context, idx int, bucket string, gr *GetObjectReader) (err error) {
 	objInfo := gr.ObjInfo
 
 	defer func() {
@@ -623,9 +620,11 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 
 	if objInfo.isMultipart() {
 		res, err := z.NewMultipartUpload(ctx, bucket, objInfo.Name, ObjectOptions{
-			VersionID:   objInfo.VersionID,
-			UserDefined: objInfo.UserDefined,
-			NoAuditLog:  true,
+			VersionID:    objInfo.VersionID,
+			UserDefined:  objInfo.UserDefined,
+			NoAuditLog:   true,
+			SrcPoolIdx:   idx,
+			DataMovement: true,
 		})
 		if err != nil {
 			return fmt.Errorf("decommissionObject: NewMultipartUpload() %w", err)
@@ -660,6 +659,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 			}
 		}
 		_, err = z.CompleteMultipartUpload(ctx, bucket, objInfo.Name, res.UploadID, parts, ObjectOptions{
+			SrcPoolIdx:   idx,
 			DataMovement: true,
 			MTime:        objInfo.ModTime,
 			NoAuditLog:   true,
@@ -681,6 +681,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 		NewPutObjReader(hr),
 		ObjectOptions{
 			DataMovement: true,
+			SrcPoolIdx:   idx,
 			VersionID:    objInfo.VersionID,
 			MTime:        objInfo.ModTime,
 			UserDefined:  objInfo.UserDefined,
@@ -836,7 +837,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 				if filterLifecycle(bi.Name, version.Name, version) {
 					expired++
 					decommissioned++
-					stopFn(errors.New("ILM expired object/version will be skipped"))
+					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
 
@@ -846,7 +847,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 				remainingVersions := len(fivs.Versions) - expired
 				if version.Deleted && remainingVersions == 1 {
 					decommissioned++
-					stopFn(errors.New("DELETE marked object with no other non-current versions will be skipped"))
+					stopFn(version.Size, errors.New("DELETE marked object with no other non-current versions will be skipped"))
 					continue
 				}
 
@@ -855,6 +856,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					versionID = nullVersionID
 				}
 
+				var failure, ignore bool
 				if version.Deleted {
 					_, err := z.DeleteObject(ctx,
 						bi.Name,
@@ -867,17 +869,22 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 							VersionID:          versionID,
 							MTime:              version.ModTime,
 							DeleteReplication:  version.ReplicationState,
+							SrcPoolIdx:         idx,
+							DataMovement:       true,
 							DeleteMarker:       true, // make sure we create a delete marker
 							SkipDecommissioned: true, // make sure we skip the decommissioned pool
 							NoAuditLog:         true,
 						})
-					var failure bool
 					if err != nil {
-						if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
-							err = nil
+						// This can happen when rebalance stop races with ongoing rebalance workers.
+						// These rebalance failures can be ignored.
+						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+							ignore = true
+							stopFn(0, nil)
+							continue
 						}
 					}
-					stopFn(err)
+					stopFn(version.Size, err)
 					if err != nil {
 						decomLogIf(ctx, err)
 						failure = true
@@ -893,22 +900,26 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					continue
 				}
 
-				var failure, ignore bool
 				// gr.Close() is ensured by decommissionObject().
 				for try := 0; try < 3; try++ {
 					if version.IsRemote() {
 						if err := z.DecomTieredObject(ctx, bi.Name, version.Name, version, ObjectOptions{
-							VersionID:   versionID,
-							MTime:       version.ModTime,
-							UserDefined: version.Metadata,
+							VersionID:    versionID,
+							MTime:        version.ModTime,
+							UserDefined:  version.Metadata,
+							SrcPoolIdx:   idx,
+							DataMovement: true,
 						}); err != nil {
-							stopFn(err)
-							failure = true
-							decomLogIf(ctx, err)
-							continue
+							if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+								ignore = true
+								stopFn(0, nil)
+							}
 						}
-						stopFn(nil)
-						failure = false
+						if !ignore {
+							stopFn(version.Size, err)
+							failure = err != nil
+							decomLogIf(ctx, err)
+						}
 						break
 					}
 					gr, err := set.GetObjectNInfo(ctx,
@@ -925,14 +936,14 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 						// object deleted by the application, nothing to do here we move on.
 						ignore = true
-						stopFn(nil)
+						stopFn(0, nil)
 						break
 					}
 					if err != nil && !ignore {
 						// if usage-cache.bin is not readable log and ignore it.
 						if bi.Name == minioMetaBucket && strings.Contains(version.Name, dataUsageCacheName) {
 							ignore = true
-							stopFn(err)
+							stopFn(version.Size, err)
 							decomLogIf(ctx, err)
 							break
 						}
@@ -940,16 +951,21 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					if err != nil {
 						failure = true
 						decomLogIf(ctx, err)
-						stopFn(err)
+						stopFn(version.Size, err)
 						continue
 					}
-					if err = z.decommissionObject(ctx, bi.Name, gr); err != nil {
-						stopFn(err)
+					if err = z.decommissionObject(ctx, idx, bi.Name, gr); err != nil {
+						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+							ignore = true
+							stopFn(0, nil)
+							break
+						}
+						stopFn(version.Size, err)
 						failure = true
 						decomLogIf(ctx, err)
 						continue
 					}
-					stopFn(nil)
+					stopFn(version.Size, nil)
 					failure = false
 					break
 				}
@@ -977,7 +993,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 						NoAuditLog:         true,
 					},
 				)
-				stopFn(err)
+				stopFn(0, err)
 				auditLogDecom(ctx, "DecomDeleteObject", bi.Name, entry.name, "", err)
 				if err != nil {
 					decomLogIf(ctx, err)
@@ -1038,7 +1054,7 @@ const (
 	decomMetricDecommissionRemoveObject
 )
 
-func decomTrace(d decomMetric, poolIdx int, startTime time.Time, duration time.Duration, path string, err error) madmin.TraceInfo {
+func decomTrace(d decomMetric, poolIdx int, startTime time.Time, duration time.Duration, path string, err error, sz int64) madmin.TraceInfo {
 	var errStr string
 	if err != nil {
 		errStr = err.Error()
@@ -1051,15 +1067,16 @@ func decomTrace(d decomMetric, poolIdx int, startTime time.Time, duration time.D
 		Duration:  duration,
 		Path:      path,
 		Error:     errStr,
+		Bytes:     sz,
 	}
 }
 
-func (m *decomMetrics) log(d decomMetric, poolIdx int, paths ...string) func(err error) {
+func (m *decomMetrics) log(d decomMetric, poolIdx int, paths ...string) func(z int64, err error) {
 	startTime := time.Now()
-	return func(err error) {
+	return func(sz int64, err error) {
 		duration := time.Since(startTime)
 		if globalTrace.NumSubscribers(madmin.TraceDecommission) > 0 {
-			globalTrace.Publish(decomTrace(d, poolIdx, startTime, duration, strings.Join(paths, " "), err))
+			globalTrace.Publish(decomTrace(d, poolIdx, startTime, duration, strings.Join(paths, " "), err, sz))
 		}
 	}
 }
@@ -1092,10 +1109,10 @@ func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx i
 		}
 		stopFn := globalDecommissionMetrics.log(decomMetricDecommissionBucket, idx, bucket.Name)
 		if err := z.decommissionPool(ctx, idx, pool, bucket); err != nil {
-			stopFn(err)
+			stopFn(0, err)
 			return err
 		}
-		stopFn(nil)
+		stopFn(0, nil)
 
 		z.poolMetaMutex.Lock()
 		if z.poolMeta.BucketDone(idx, bucket) {
@@ -1326,11 +1343,7 @@ func (z *erasureServerPools) Status(ctx context.Context, idx int) (PoolStatus, e
 	poolInfo := z.poolMeta.Pools[idx].Clone()
 	if poolInfo.Decommission != nil {
 		poolInfo.Decommission.TotalSize = pi.Total
-		if poolInfo.Decommission.Failed || poolInfo.Decommission.Canceled {
-			poolInfo.Decommission.CurrentSize = pi.Free
-		} else {
-			poolInfo.Decommission.CurrentSize = poolInfo.Decommission.StartSize + poolInfo.Decommission.BytesDone
-		}
+		poolInfo.Decommission.CurrentSize = pi.Free
 	} else {
 		poolInfo.Decommission = &PoolDecommissionInfo{
 			TotalSize:   pi.Total,

@@ -593,8 +593,6 @@ func generateListVersionsResponse(ctx context.Context, bucket, prefix, marker, v
 			for k, v := range cleanReservedKeys(object.UserDefined) {
 				content.UserMetadata.Set(k, v)
 			}
-
-			content.UserMetadata.Set("expires", object.Expires.Format(http.TimeFormat))
 			content.Internal = &ObjectInternalInfo{
 				K: object.DataBlocks,
 				M: object.ParityBlocks,
@@ -729,7 +727,6 @@ func generateListObjectsV2Response(ctx context.Context, bucket, prefix, token, n
 				for k, v := range cleanReservedKeys(object.UserDefined) {
 					content.UserMetadata.Set(k, v)
 				}
-				content.UserMetadata.Set("expires", object.Expires.Format(http.TimeFormat))
 				content.Internal = &ObjectInternalInfo{
 					K: object.DataBlocks,
 					M: object.ParityBlocks,
@@ -789,8 +786,8 @@ func generateInitiateMultipartUploadResponse(bucket, key, uploadID string) Initi
 }
 
 // generates CompleteMultipartUploadResponse for given bucket, key, location and ETag.
-func generateCompleteMultpartUploadResponse(bucket, key, location string, oi ObjectInfo) CompleteMultipartUploadResponse {
-	cs := oi.decryptChecksums(0)
+func generateCompleteMultipartUploadResponse(bucket, key, location string, oi ObjectInfo, h http.Header) CompleteMultipartUploadResponse {
+	cs := oi.decryptChecksums(0, h)
 	c := CompleteMultipartUploadResponse{
 		Location: location,
 		Bucket:   bucket,
@@ -946,10 +943,11 @@ func writeSuccessResponseHeadersOnly(w http.ResponseWriter) {
 
 // writeErrorResponse writes error headers
 func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
-	if err.HTTPStatusCode == http.StatusServiceUnavailable {
-		// Set retry-after header to indicate user-agents to retry request after 120secs.
+	switch err.HTTPStatusCode {
+	case http.StatusServiceUnavailable, http.StatusTooManyRequests:
+		// Set retry-after header to indicate user-agents to retry request after 60 seconds.
 		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
-		w.Header().Set(xhttp.RetryAfter, "120")
+		w.Header().Set(xhttp.RetryAfter, "60")
 	}
 
 	switch err.Code {

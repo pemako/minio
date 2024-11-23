@@ -20,7 +20,6 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os"
 	"path"
 	"sort"
@@ -258,9 +257,9 @@ func (e *metaCacheEntry) fileInfo(bucket string) (FileInfo, error) {
 				ModTime:  timeSentinel1970,
 			}, nil
 		}
-		return e.cached.ToFileInfo(bucket, e.name, "", false, false)
+		return e.cached.ToFileInfo(bucket, e.name, "", false, true)
 	}
-	return getFileInfo(e.metadata, bucket, e.name, "", false, false)
+	return getFileInfo(e.metadata, bucket, e.name, "", fileInfoOpts{})
 }
 
 // xlmeta returns the decoded metadata.
@@ -301,7 +300,7 @@ func (e *metaCacheEntry) fileInfoVersions(bucket string) (FileInfoVersions, erro
 		}, nil
 	}
 	// Too small gains to reuse cache here.
-	return getFileInfoVersions(e.metadata, bucket, e.name, false)
+	return getFileInfoVersions(e.metadata, bucket, e.name, true)
 }
 
 // metaCacheEntries is a slice of metacache entries.
@@ -385,9 +384,6 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 		// shallow decode.
 		xl, err := entry.xlmeta()
 		if err != nil {
-			if !errors.Is(err, errFileNotFound) {
-				internalLogIf(GlobalContext, err)
-			}
 			continue
 		}
 		objsValid++
@@ -536,6 +532,9 @@ func (m *metaCacheEntriesSorted) fileInfoVersions(bucket, prefix, delimiter, aft
 			}
 
 			for _, version := range fiVersions {
+				if !version.VersionPurgeStatus().Empty() {
+					continue
+				}
 				versioned := vcfg != nil && vcfg.Versioned(entry.name)
 				versions = append(versions, version.ToObjectInfo(bucket, entry.name, versioned))
 			}
@@ -597,7 +596,7 @@ func (m *metaCacheEntriesSorted) fileInfos(bucket, prefix, delimiter string) (ob
 			}
 
 			fi, err := entry.fileInfo(bucket)
-			if err == nil {
+			if err == nil && fi.VersionPurgeStatus().Empty() {
 				versioned := vcfg != nil && vcfg.Versioned(entry.name)
 				objects = append(objects, fi.ToObjectInfo(bucket, entry.name, versioned))
 			}
@@ -752,7 +751,9 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 				if !dirMatches {
 					// We have an object `name` or 'name/' and a directory `name/`.
 					if other.isDir() {
-						console.Debugln("mergeEntryChannels: discarding directory", other.name, "for object", best.name)
+						if serverDebugLog {
+							console.Debugln("mergeEntryChannels: discarding directory", other.name, "for object", best.name)
+						}
 						// Discard the directory.
 						if err := selectFrom(otherIdx); err != nil {
 							return err
@@ -760,7 +761,9 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 						continue
 					}
 					// Replace directory with object.
-					console.Debugln("mergeEntryChannels: discarding directory", best.name, "for object", other.name)
+					if serverDebugLog {
+						console.Debugln("mergeEntryChannels: discarding directory", best.name, "for object", other.name)
+					}
 					toMerge = toMerge[:0]
 					best = other
 					bestIdx = otherIdx

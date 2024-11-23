@@ -276,6 +276,8 @@ func (z *xlMetaDataDirDecoder) DecodeMsg(dc *msgp.Reader) (err error) {
 		err = msgp.WrapError(err)
 		return
 	}
+	var zb0001Mask uint8 /* 1 bits */
+	_ = zb0001Mask
 	for zb0001 > 0 {
 		zb0001--
 		field, err = dc.ReadMapKeyPtr()
@@ -327,12 +329,19 @@ func (z *xlMetaDataDirDecoder) DecodeMsg(dc *msgp.Reader) (err error) {
 					}
 				}
 			}
+			zb0001Mask |= 0x1
 		default:
 			err = dc.Skip()
 			if err != nil {
 				err = msgp.WrapError(err)
 				return
 			}
+		}
+	}
+	// Clear omitted fields.
+	if zb0001Mask != 0x1 {
+		if (zb0001Mask & 0x1) == 0 {
+			z.ObjectV2 = nil
 		}
 	}
 	return
@@ -425,6 +434,8 @@ func (z *xlMetaDataDirDecoder) UnmarshalMsg(bts []byte) (o []byte, err error) {
 		err = msgp.WrapError(err)
 		return
 	}
+	var zb0001Mask uint8 /* 1 bits */
+	_ = zb0001Mask
 	for zb0001 > 0 {
 		zb0001--
 		field, bts, err = msgp.ReadMapKeyZC(bts)
@@ -475,12 +486,19 @@ func (z *xlMetaDataDirDecoder) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					}
 				}
 			}
+			zb0001Mask |= 0x1
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
 				err = msgp.WrapError(err)
 				return
 			}
+		}
+	}
+	// Clear omitted fields.
+	if zb0001Mask != 0x1 {
+		if (zb0001Mask & 0x1) == 0 {
+			z.ObjectV2 = nil
 		}
 	}
 	o = bts
@@ -508,6 +526,8 @@ func (z *xlMetaV2DeleteMarker) DecodeMsg(dc *msgp.Reader) (err error) {
 		err = msgp.WrapError(err)
 		return
 	}
+	var zb0001Mask uint8 /* 1 bits */
+	_ = zb0001Mask
 	for zb0001 > 0 {
 		zb0001--
 		field, err = dc.ReadMapKeyPtr()
@@ -558,12 +578,19 @@ func (z *xlMetaV2DeleteMarker) DecodeMsg(dc *msgp.Reader) (err error) {
 				}
 				z.MetaSys[za0002] = za0003
 			}
+			zb0001Mask |= 0x1
 		default:
 			err = dc.Skip()
 			if err != nil {
 				err = msgp.WrapError(err)
 				return
 			}
+		}
+	}
+	// Clear omitted fields.
+	if zb0001Mask != 0x1 {
+		if (zb0001Mask & 0x1) == 0 {
+			z.MetaSys = nil
 		}
 	}
 	return
@@ -678,6 +705,8 @@ func (z *xlMetaV2DeleteMarker) UnmarshalMsg(bts []byte) (o []byte, err error) {
 		err = msgp.WrapError(err)
 		return
 	}
+	var zb0001Mask uint8 /* 1 bits */
+	_ = zb0001Mask
 	for zb0001 > 0 {
 		zb0001--
 		field, bts, err = msgp.ReadMapKeyZC(bts)
@@ -728,12 +757,19 @@ func (z *xlMetaV2DeleteMarker) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				}
 				z.MetaSys[za0002] = za0003
 			}
+			zb0001Mask |= 0x1
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
 				err = msgp.WrapError(err)
 				return
 			}
+		}
+	}
+	// Clear omitted fields.
+	if zb0001Mask != 0x1 {
+		if (zb0001Mask & 0x1) == 0 {
+			z.MetaSys = nil
 		}
 	}
 	o = bts
@@ -762,6 +798,8 @@ func (z *xlMetaV2Object) DecodeMsg(dc *msgp.Reader) (err error) {
 		err = msgp.WrapError(err)
 		return
 	}
+	var zb0001Mask uint8 /* 1 bits */
+	_ = zb0001Mask
 	for zb0001 > 0 {
 		zb0001--
 		field, err = dc.ReadMapKeyPtr()
@@ -958,6 +996,7 @@ func (z *xlMetaV2Object) DecodeMsg(dc *msgp.Reader) (err error) {
 					return
 				}
 			}
+			zb0001Mask |= 0x1
 		case "Size":
 			z.Size, err = dc.ReadInt64()
 			if err != nil {
@@ -1054,6 +1093,12 @@ func (z *xlMetaV2Object) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err)
 				return
 			}
+		}
+	}
+	// Clear omitted fields.
+	if zb0001Mask != 0x1 {
+		if (zb0001Mask & 0x1) == 0 {
+			z.PartIndices = nil
 		}
 	}
 	return
@@ -1483,6 +1528,8 @@ func (z *xlMetaV2Object) UnmarshalMsg(bts []byte) (o []byte, err error) {
 		err = msgp.WrapError(err)
 		return
 	}
+	var zb0001Mask uint8 /* 1 bits */
+	_ = zb0001Mask
 	for zb0001 > 0 {
 		zb0001--
 		field, bts, err = msgp.ReadMapKeyZC(bts)
@@ -1671,6 +1718,7 @@ func (z *xlMetaV2Object) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+			zb0001Mask |= 0x1
 		case "Size":
 			z.Size, bts, err = msgp.ReadInt64Bytes(bts)
 			if err != nil {
@@ -1761,6 +1809,12 @@ func (z *xlMetaV2Object) UnmarshalMsg(bts []byte) (o []byte, err error) {
 			}
 		}
 	}
+	// Clear omitted fields.
+	if zb0001Mask != 0x1 {
+		if (zb0001Mask & 0x1) == 0 {
+			z.PartIndices = nil
+		}
+	}
 	o = bts
 	return
 }
@@ -1802,6 +1856,8 @@ func (z *xlMetaV2Version) DecodeMsg(dc *msgp.Reader) (err error) {
 		err = msgp.WrapError(err)
 		return
 	}
+	var zb0001Mask uint8 /* 3 bits */
+	_ = zb0001Mask
 	for zb0001 > 0 {
 		zb0001--
 		field, err = dc.ReadMapKeyPtr()
@@ -1838,6 +1894,7 @@ func (z *xlMetaV2Version) DecodeMsg(dc *msgp.Reader) (err error) {
 					return
 				}
 			}
+			zb0001Mask |= 0x1
 		case "V2Obj":
 			if dc.IsNil() {
 				err = dc.ReadNil()
@@ -1856,6 +1913,7 @@ func (z *xlMetaV2Version) DecodeMsg(dc *msgp.Reader) (err error) {
 					return
 				}
 			}
+			zb0001Mask |= 0x2
 		case "DelObj":
 			if dc.IsNil() {
 				err = dc.ReadNil()
@@ -1874,6 +1932,7 @@ func (z *xlMetaV2Version) DecodeMsg(dc *msgp.Reader) (err error) {
 					return
 				}
 			}
+			zb0001Mask |= 0x4
 		case "v":
 			z.WrittenByVersion, err = dc.ReadUint64()
 			if err != nil {
@@ -1886,6 +1945,18 @@ func (z *xlMetaV2Version) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err)
 				return
 			}
+		}
+	}
+	// Clear omitted fields.
+	if zb0001Mask != 0x7 {
+		if (zb0001Mask & 0x1) == 0 {
+			z.ObjectV1 = nil
+		}
+		if (zb0001Mask & 0x2) == 0 {
+			z.ObjectV2 = nil
+		}
+		if (zb0001Mask & 0x4) == 0 {
+			z.DeleteMarker = nil
 		}
 	}
 	return
@@ -2079,6 +2150,8 @@ func (z *xlMetaV2Version) UnmarshalMsg(bts []byte) (o []byte, err error) {
 		err = msgp.WrapError(err)
 		return
 	}
+	var zb0001Mask uint8 /* 3 bits */
+	_ = zb0001Mask
 	for zb0001 > 0 {
 		zb0001--
 		field, bts, err = msgp.ReadMapKeyZC(bts)
@@ -2114,6 +2187,7 @@ func (z *xlMetaV2Version) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+			zb0001Mask |= 0x1
 		case "V2Obj":
 			if msgp.IsNil(bts) {
 				bts, err = msgp.ReadNilBytes(bts)
@@ -2131,6 +2205,7 @@ func (z *xlMetaV2Version) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+			zb0001Mask |= 0x2
 		case "DelObj":
 			if msgp.IsNil(bts) {
 				bts, err = msgp.ReadNilBytes(bts)
@@ -2148,6 +2223,7 @@ func (z *xlMetaV2Version) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+			zb0001Mask |= 0x4
 		case "v":
 			z.WrittenByVersion, bts, err = msgp.ReadUint64Bytes(bts)
 			if err != nil {
@@ -2160,6 +2236,18 @@ func (z *xlMetaV2Version) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err)
 				return
 			}
+		}
+	}
+	// Clear omitted fields.
+	if zb0001Mask != 0x7 {
+		if (zb0001Mask & 0x1) == 0 {
+			z.ObjectV1 = nil
+		}
+		if (zb0001Mask & 0x2) == 0 {
+			z.ObjectV2 = nil
+		}
+		if (zb0001Mask & 0x4) == 0 {
+			z.DeleteMarker = nil
 		}
 	}
 	o = bts
@@ -2235,14 +2323,14 @@ func (z *xlMetaV2VersionHeader) DecodeMsg(dc *msgp.Reader) (err error) {
 		}
 		z.Flags = xlFlags(zb0003)
 	}
-	z.EcM, err = dc.ReadUint8()
-	if err != nil {
-		err = msgp.WrapError(err, "EcM")
-		return
-	}
 	z.EcN, err = dc.ReadUint8()
 	if err != nil {
 		err = msgp.WrapError(err, "EcN")
+		return
+	}
+	z.EcM, err = dc.ReadUint8()
+	if err != nil {
+		err = msgp.WrapError(err, "EcM")
 		return
 	}
 	return
@@ -2280,14 +2368,14 @@ func (z *xlMetaV2VersionHeader) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "Flags")
 		return
 	}
-	err = en.WriteUint8(z.EcM)
-	if err != nil {
-		err = msgp.WrapError(err, "EcM")
-		return
-	}
 	err = en.WriteUint8(z.EcN)
 	if err != nil {
 		err = msgp.WrapError(err, "EcN")
+		return
+	}
+	err = en.WriteUint8(z.EcM)
+	if err != nil {
+		err = msgp.WrapError(err, "EcM")
 		return
 	}
 	return
@@ -2303,8 +2391,8 @@ func (z *xlMetaV2VersionHeader) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.AppendBytes(o, (z.Signature)[:])
 	o = msgp.AppendUint8(o, uint8(z.Type))
 	o = msgp.AppendUint8(o, uint8(z.Flags))
-	o = msgp.AppendUint8(o, z.EcM)
 	o = msgp.AppendUint8(o, z.EcN)
+	o = msgp.AppendUint8(o, z.EcM)
 	return
 }
 
@@ -2353,14 +2441,14 @@ func (z *xlMetaV2VersionHeader) UnmarshalMsg(bts []byte) (o []byte, err error) {
 		}
 		z.Flags = xlFlags(zb0003)
 	}
-	z.EcM, bts, err = msgp.ReadUint8Bytes(bts)
-	if err != nil {
-		err = msgp.WrapError(err, "EcM")
-		return
-	}
 	z.EcN, bts, err = msgp.ReadUint8Bytes(bts)
 	if err != nil {
 		err = msgp.WrapError(err, "EcN")
+		return
+	}
+	z.EcM, bts, err = msgp.ReadUint8Bytes(bts)
+	if err != nil {
+		err = msgp.WrapError(err, "EcM")
 		return
 	}
 	o = bts

@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/xml"
@@ -36,7 +35,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/gzhttp"
@@ -50,7 +48,6 @@ import (
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
-	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/config/dns"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/crypto"
@@ -65,7 +62,6 @@ import (
 	"github.com/minio/minio/internal/s3select"
 	"github.com/minio/mux"
 	"github.com/minio/pkg/v3/policy"
-	"github.com/valyala/bytebufferpool"
 )
 
 // supportedHeadGetReqParams - supported request parameters for GET and HEAD presigned request.
@@ -383,92 +379,6 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 		}
 	}
 
-	cachedResult := globalCacheConfig.Enabled() && opts.VersionID == ""
-
-	var update bool
-	if cachedResult {
-		rc := &cache.CondCheck{}
-		h := r.Header.Clone()
-		if opts.PartNumber > 0 {
-			h.Set(xhttp.PartNumber, strconv.Itoa(opts.PartNumber))
-		}
-		rc.Init(bucket, object, h)
-
-		ci, err := globalCacheConfig.Get(rc)
-		if ci != nil {
-			tgs, ok := ci.Metadata[xhttp.AmzObjectTagging]
-			if ok {
-				// Set this such that authorization policies can be applied on the object tags.
-				r.Header.Set(xhttp.AmzObjectTagging, tgs)
-			}
-
-			if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
-				writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
-				return
-			}
-
-			okSt := (ci.StatusCode == http.StatusOK || ci.StatusCode == http.StatusPartialContent ||
-				ci.StatusCode == http.StatusPreconditionFailed || ci.StatusCode == http.StatusNotModified)
-			if okSt {
-				ci.WriteHeaders(w, func() {
-					// set common headers
-					setCommonHeaders(w)
-				}, func() {
-					okSt := (ci.StatusCode == http.StatusOK || ci.StatusCode == http.StatusPartialContent)
-					if okSt && len(ci.Data) > 0 {
-						for k, v := range ci.Metadata {
-							w.Header().Set(k, v)
-						}
-
-						if opts.PartNumber > 0 && strings.Contains(ci.ETag, "-") {
-							w.Header()[xhttp.AmzMpPartsCount] = []string{
-								strings.TrimLeftFunc(ci.ETag, func(r rune) bool {
-									return !unicode.IsNumber(r)
-								}),
-							}
-						}
-
-						// For providing ranged content
-						start, rangeLen, err := rs.GetOffsetLength(ci.Size)
-						if err != nil {
-							start, rangeLen = 0, ci.Size
-						}
-
-						// Set content length.
-						w.Header().Set(xhttp.ContentLength, strconv.FormatInt(rangeLen, 10))
-						if rs != nil {
-							contentRange := fmt.Sprintf("bytes %d-%d/%d", start, start+rangeLen-1, ci.Size)
-							w.Header().Set(xhttp.ContentRange, contentRange)
-						}
-
-						io.Copy(w, bytes.NewReader(ci.Data))
-						return
-					}
-					if ci.StatusCode == http.StatusPreconditionFailed {
-						writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPreconditionFailed), r.URL)
-						return
-					} else if ci.StatusCode == http.StatusNotModified {
-						w.WriteHeader(ci.StatusCode)
-						return
-					}
-
-					// We did not satisfy any requirement from the cache, update the cache.
-					// this basically means that we do not have the Data for the object
-					// cached yet
-					update = true
-				})
-				if !update {
-					// No update is needed means we have written already to the client just return here.
-					return
-				}
-			}
-		}
-
-		if errors.Is(err, cache.ErrKeyMissing) {
-			update = true
-		}
-	}
-
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
 		if _, err := DecryptObjectInfo(&oi, r); err != nil {
@@ -497,15 +407,15 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 			reader *GetObjectReader
 			perr   error
 		)
-		// avoid proxying if version is a delete marker
-		if !isErrMethodNotAllowed(err) && !(gr != nil && gr.ObjInfo.DeleteMarker) {
+
+		if (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) && !(gr != nil && gr.ObjInfo.DeleteMarker) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
-				globalReplicationStats.incProxy(bucket, getObjectAPI, false)
+				globalReplicationStats.Load().incProxy(bucket, getObjectAPI, false)
 				// proxy to replication target if active-active replication is in place.
 				reader, proxy, perr = proxyGetToReplicationTarget(ctx, bucket, object, rs, r.Header, opts, proxytgts)
 				if perr != nil {
-					globalReplicationStats.incProxy(bucket, getObjectAPI, true)
+					globalReplicationStats.Load().incProxy(bucket, getObjectAPI, true)
 					proxyGetErr := ErrorRespToObjectError(perr, bucket, object)
 					if !isErrBucketNotFound(proxyGetErr) && !isErrObjectNotFound(proxyGetErr) && !isErrVersionNotFound(proxyGetErr) &&
 						!isErrPreconditionFailed(proxyGetErr) && !isErrInvalidRange(proxyGetErr) {
@@ -611,40 +521,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 
 	if r.Header.Get(xhttp.AmzChecksumMode) == "ENABLED" && rs == nil {
 		// AWS S3 silently drops checksums on range requests.
-		hash.AddChecksumHeader(w, objInfo.decryptChecksums(opts.PartNumber))
-	}
-
-	var buf *bytebufferpool.ByteBuffer
-	if update {
-		if globalCacheConfig.MatchesSize(objInfo.Size) {
-			buf = bytebufferpool.Get()
-			defer bytebufferpool.Put(buf)
-		}
-		defer func() {
-			var data []byte
-			if buf != nil {
-				data = buf.Bytes()
-			}
-
-			asize, err := objInfo.GetActualSize()
-			if err != nil {
-				asize = objInfo.Size
-			}
-
-			globalCacheConfig.Set(&cache.ObjectInfo{
-				Key:          objInfo.Name,
-				Bucket:       objInfo.Bucket,
-				ETag:         objInfo.ETag,
-				ModTime:      objInfo.ModTime,
-				Expires:      objInfo.ExpiresStr(),
-				CacheControl: objInfo.CacheControl,
-				Metadata:     cleanReservedKeys(objInfo.UserDefined),
-				Range:        rangeHeader,
-				PartNumber:   opts.PartNumber,
-				Size:         asize,
-				Data:         data,
-			})
-		}()
+		hash.AddChecksumHeader(w, objInfo.decryptChecksums(opts.PartNumber, r.Header))
 	}
 
 	if err = setObjectHeaders(ctx, w, objInfo, rs, opts); err != nil {
@@ -661,9 +538,6 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 
 	var iw io.Writer
 	iw = w
-	if buf != nil {
-		iw = io.MultiWriter(w, buf)
-	}
 
 	statusCodeWritten := false
 	httpWriter := xioutil.WriteOnClose(iw)
@@ -758,23 +632,16 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 	w.Header().Del(xhttp.ContentType)
 
 	if _, ok := opts.ObjectAttributes[xhttp.Checksum]; ok {
-		chkSums := objInfo.decryptChecksums(0)
+		chkSums := objInfo.decryptChecksums(0, r.Header)
 		// AWS does not appear to append part number on this API call.
-		switch {
-		case chkSums["CRC32"] != "":
-			OA.Checksum = new(objectAttributesChecksum)
-			OA.Checksum.ChecksumCRC32 = strings.Split(chkSums["CRC32"], "-")[0]
-		case chkSums["CRC32C"] != "":
-			OA.Checksum = new(objectAttributesChecksum)
-			OA.Checksum.ChecksumCRC32C = strings.Split(chkSums["CRC32C"], "-")[0]
-		case chkSums["SHA256"] != "":
-			OA.Checksum = new(objectAttributesChecksum)
-			OA.Checksum.ChecksumSHA1 = strings.Split(chkSums["SHA1"], "-")[0]
-		case chkSums["SHA1"] != "":
-			OA.Checksum = new(objectAttributesChecksum)
-			OA.Checksum.ChecksumSHA256 = strings.Split(chkSums["SHA256"], "-")[0]
+		if len(chkSums) > 0 {
+			OA.Checksum = &objectAttributesChecksum{
+				ChecksumCRC32:  strings.Split(chkSums["CRC32"], "-")[0],
+				ChecksumCRC32C: strings.Split(chkSums["CRC32C"], "-")[0],
+				ChecksumSHA1:   strings.Split(chkSums["SHA1"], "-")[0],
+				ChecksumSHA256: strings.Split(chkSums["SHA256"], "-")[0],
+			}
 		}
-
 	}
 
 	if _, ok := opts.ObjectAttributes[xhttp.ETag]; ok {
@@ -789,7 +656,7 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 		OA.StorageClass = filterStorageClass(ctx, objInfo.StorageClass)
 	}
 
-	objInfo.decryptPartsChecksums()
+	objInfo.decryptPartsChecksums(r.Header)
 
 	if _, ok := opts.ObjectAttributes[xhttp.ObjectParts]; ok {
 		OA.ObjectParts = new(objectAttributesParts)
@@ -948,97 +815,22 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 		}
 	}
 
-	cachedResult := globalCacheConfig.Enabled() && opts.VersionID == ""
-
-	var update bool
-	if cachedResult {
-		rc := &cache.CondCheck{}
-		h := r.Header.Clone()
-		if opts.PartNumber > 0 {
-			h.Set(xhttp.PartNumber, strconv.Itoa(opts.PartNumber))
-		}
-		rc.Init(bucket, object, h)
-
-		ci, err := globalCacheConfig.Get(rc)
-		if ci != nil {
-			tgs, ok := ci.Metadata[xhttp.AmzObjectTagging]
-			if ok {
-				// Set this such that authorization policies can be applied on the object tags.
-				r.Header.Set(xhttp.AmzObjectTagging, tgs)
-			}
-
-			if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
-				writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
-				return
-			}
-
-			okSt := (ci.StatusCode == http.StatusOK || ci.StatusCode == http.StatusPartialContent ||
-				ci.StatusCode == http.StatusPreconditionFailed || ci.StatusCode == http.StatusNotModified)
-			if okSt {
-				ci.WriteHeaders(w, func() {
-					// set common headers
-					setCommonHeaders(w)
-				}, func() {
-					okSt := (ci.StatusCode == http.StatusOK || ci.StatusCode == http.StatusPartialContent)
-					if okSt {
-						for k, v := range ci.Metadata {
-							w.Header().Set(k, v)
-						}
-
-						// For providing ranged content
-						start, rangeLen, err := rs.GetOffsetLength(ci.Size)
-						if err != nil {
-							start, rangeLen = 0, ci.Size
-						}
-
-						if opts.PartNumber > 0 && strings.Contains(ci.ETag, "-") {
-							w.Header()[xhttp.AmzMpPartsCount] = []string{
-								strings.TrimLeftFunc(ci.ETag, func(r rune) bool {
-									return !unicode.IsNumber(r)
-								}),
-							}
-						}
-
-						// Set content length for the range.
-						w.Header().Set(xhttp.ContentLength, strconv.FormatInt(rangeLen, 10))
-						if rs != nil {
-							contentRange := fmt.Sprintf("bytes %d-%d/%d", start, start+rangeLen-1, ci.Size)
-							w.Header().Set(xhttp.ContentRange, contentRange)
-						}
-
-						return
-					}
-					if ci.StatusCode == http.StatusPreconditionFailed {
-						writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPreconditionFailed), r.URL)
-						return
-					}
-
-					w.WriteHeader(ci.StatusCode)
-				})
-				return
-			}
-		}
-		if errors.Is(err, cache.ErrKeyMissing) {
-			update = true
-		}
-	}
-
 	opts.FastGetObjInfo = true
 
 	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
 	var proxy proxyResult
-	if err != nil && !objInfo.DeleteMarker && !isErrMethodNotAllowed(err) {
+	if err != nil && !objInfo.DeleteMarker && (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) {
 		// proxy HEAD to replication target if active-active replication configured on bucket
 		proxytgts := getProxyTargets(ctx, bucket, object, opts)
 		if !proxytgts.Empty() {
-			globalReplicationStats.incProxy(bucket, headObjectAPI, false)
+			globalReplicationStats.Load().incProxy(bucket, headObjectAPI, false)
 			var oi ObjectInfo
 			oi, proxy = proxyHeadToReplicationTarget(ctx, bucket, object, rs, opts, proxytgts)
 			if proxy.Proxy {
 				objInfo = oi
 			}
 			if proxy.Err != nil {
-				globalReplicationStats.incProxy(bucket, headObjectAPI, true)
+				globalReplicationStats.Load().incProxy(bucket, headObjectAPI, true)
 				writeErrorResponseHeadersOnly(w, toAPIError(ctx, proxy.Err))
 				return
 			}
@@ -1124,24 +916,6 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 		return
 	}
 
-	if update {
-		asize, err := objInfo.GetActualSize()
-		if err != nil {
-			asize = objInfo.Size
-		}
-
-		defer globalCacheConfig.Set(&cache.ObjectInfo{
-			Key:          objInfo.Name,
-			Bucket:       objInfo.Bucket,
-			ETag:         objInfo.ETag,
-			ModTime:      objInfo.ModTime,
-			Expires:      objInfo.ExpiresStr(),
-			CacheControl: objInfo.CacheControl,
-			Size:         asize,
-			Metadata:     cleanReservedKeys(objInfo.UserDefined),
-		})
-	}
-
 	// Validate pre-conditions if any.
 	if checkPreconditions(ctx, w, r, objInfo, opts) {
 		return
@@ -1169,7 +943,7 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 
 	if r.Header.Get(xhttp.AmzChecksumMode) == "ENABLED" && rs == nil {
 		// AWS S3 silently drops checksums on range requests.
-		hash.AddChecksumHeader(w, objInfo.decryptChecksums(opts.PartNumber))
+		hash.AddChecksumHeader(w, objInfo.decryptChecksums(opts.PartNumber, r.Header))
 	}
 
 	// Set standard object headers.
@@ -1469,9 +1243,10 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 
 	// convert copy src encryption options for GET calls
 	getOpts := ObjectOptions{
-		VersionID:        srcOpts.VersionID,
-		Versioned:        srcOpts.Versioned,
-		VersionSuspended: srcOpts.VersionSuspended,
+		VersionID:          srcOpts.VersionID,
+		Versioned:          srcOpts.Versioned,
+		VersionSuspended:   srcOpts.VersionSuspended,
+		ReplicationRequest: r.Header.Get(xhttp.MinIOSourceReplicationRequest) == "true",
 	}
 	getSSE := encrypt.SSE(srcOpts.ServerSideEncryption)
 	if getSSE != srcOpts.ServerSideEncryption {
@@ -1558,16 +1333,12 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// Check if either the source is encrypted or the destination will be encrypted.
-	objectEncryption := crypto.Requested(r.Header)
-	objectEncryption = objectEncryption || crypto.IsSourceEncrypted(srcInfo.UserDefined)
-
 	var compressMetadata map[string]string
 	// No need to compress for remote etcd calls
 	// Pass the decompressed stream to such calls.
 	isDstCompressed := isCompressible(r.Header, dstObject) &&
 		length > minCompressibleSize &&
-		!isRemoteCopyRequired(ctx, srcBucket, dstBucket, objectAPI) && !cpSrcDstSame && !objectEncryption
+		!isRemoteCopyRequired(ctx, srcBucket, dstBucket, objectAPI)
 	if isDstCompressed {
 		compressMetadata = make(map[string]string, 2)
 		// Preserving the compression metadata.
@@ -1603,7 +1374,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 	// Encryption parameters not present for this object.
-	if crypto.SSEC.IsEncrypted(srcInfo.UserDefined) && !crypto.SSECopy.IsRequested(r.Header) {
+	if crypto.SSEC.IsEncrypted(srcInfo.UserDefined) && !crypto.SSECopy.IsRequested(r.Header) && r.Header.Get(xhttp.MinIOSourceReplicationRequest) != "true" {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidSSECustomerAlgorithm), r.URL)
 		return
 	}
@@ -1751,7 +1522,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			if !srcTimestamp.IsZero() {
 				ondiskTimestamp, err := time.Parse(time.RFC3339Nano, lastTaggingTimestamp)
 				// update tagging metadata only if replica  timestamp is newer than what's on disk
-				if err != nil || (err == nil && ondiskTimestamp.Before(srcTimestamp)) {
+				if err != nil || (err == nil && !ondiskTimestamp.After(srcTimestamp)) {
 					srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
 					srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
 				}
@@ -1850,7 +1621,10 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// if encryption is enabled we do not need explicit "REPLACE" metadata to
 	// be enabled as well - this is to allow for key-rotation.
 	if !isDirectiveReplace(r.Header.Get(xhttp.AmzMetadataDirective)) && !isDirectiveReplace(r.Header.Get(xhttp.AmzTagDirective)) &&
-		srcInfo.metadataOnly && srcOpts.VersionID == "" && !objectEncryption {
+		srcInfo.metadataOnly && srcOpts.VersionID == "" &&
+		!crypto.Requested(r.Header) &&
+		!crypto.IsSourceEncrypted(srcInfo.UserDefined) {
+
 		// If x-amz-metadata-directive is not set to REPLACE then we need
 		// to error out if source and destination are same.
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidCopyDest), r.URL)
@@ -1929,7 +1703,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		scheduleReplication(ctx, objInfo, objectAPI, dsc, replication.ObjectReplicationType)
 	}
 
-	setPutObjHeaders(w, objInfo, false)
+	setPutObjHeaders(w, objInfo, false, r.Header)
 	// We must not use the http.Header().Set method here because some (broken)
 	// clients expect the x-amz-copy-source-version-id header key to be literally
 	// "x-amz-copy-source-version-id"- not in canonicalized form, preserve it.
@@ -1949,22 +1723,6 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		RespElements: extractRespElements(w),
 		UserAgent:    r.UserAgent(),
 		Host:         handlers.GetSourceIP(r),
-	})
-
-	asize, err := objInfo.GetActualSize()
-	if err != nil {
-		asize = objInfo.Size
-	}
-
-	defer globalCacheConfig.Set(&cache.ObjectInfo{
-		Key:          objInfo.Name,
-		Bucket:       objInfo.Bucket,
-		ETag:         objInfo.ETag,
-		ModTime:      objInfo.ModTime,
-		Expires:      objInfo.ExpiresStr(),
-		CacheControl: objInfo.CacheControl,
-		Size:         asize,
-		Metadata:     cleanReservedKeys(objInfo.UserDefined),
 	})
 
 	if !remoteCallRequired && !globalTierConfigMgr.Empty() {
@@ -2129,7 +1887,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		}
 		metadata[ReservedMetadataPrefixLower+ReplicaStatus] = replication.Replica.String()
 		metadata[ReservedMetadataPrefixLower+ReplicaTimestamp] = UTCNow().Format(time.RFC3339Nano)
-		defer globalReplicationStats.UpdateReplicaStat(bucket, size)
+		defer globalReplicationStats.Load().UpdateReplicaStat(bucket, size)
 	}
 
 	// Check if bucket encryption is enabled
@@ -2138,17 +1896,8 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		AutoEncrypt: globalAutoEncryption,
 	})
 
-	var buf *bytebufferpool.ByteBuffer
-	if globalCacheConfig.MatchesSize(size) {
-		buf = bytebufferpool.Get()
-		defer bytebufferpool.Put(buf)
-	}
-
 	var reader io.Reader
 	reader = rd
-	if buf != nil {
-		reader = io.TeeReader(rd, buf)
-	}
 
 	actualSize := size
 	var idxCb func() []byte
@@ -2211,6 +1960,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 	opts.IndexCB = idxCb
+	opts.WantChecksum = hashReader.Checksum()
 
 	if opts.PreserveETag != "" ||
 		r.Header.Get(xhttp.IfMatch) != "" ||
@@ -2259,11 +2009,6 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 
 		if crypto.SSEC.IsRequested(r.Header) && crypto.S3KMS.IsRequested(r.Header) {
 			writeErrorResponse(ctx, w, toAPIError(ctx, crypto.ErrIncompatibleEncryptionMethod), r.URL)
-			return
-		}
-
-		if crypto.SSEC.IsRequested(r.Header) && isCompressible(r.Header, object) {
-			writeErrorResponse(ctx, w, toAPIError(ctx, crypto.ErrIncompatibleEncryptionWithCompression), r.URL)
 			return
 		}
 
@@ -2351,31 +2096,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		scheduleReplication(ctx, objInfo, objectAPI, dsc, replication.ObjectReplicationType)
 	}
 
-	setPutObjHeaders(w, objInfo, false)
-
-	defer func() {
-		var data []byte
-		if buf != nil {
-			data = buf.Bytes()
-		}
-
-		asize, err := objInfo.GetActualSize()
-		if err != nil {
-			asize = objInfo.Size
-		}
-
-		globalCacheConfig.Set(&cache.ObjectInfo{
-			Key:          objInfo.Name,
-			Bucket:       objInfo.Bucket,
-			ETag:         objInfo.ETag,
-			ModTime:      objInfo.ModTime,
-			Expires:      objInfo.ExpiresStr(),
-			CacheControl: objInfo.CacheControl,
-			Size:         asize,
-			Metadata:     cleanReservedKeys(objInfo.UserDefined),
-			Data:         data,
-		})
-	}()
+	setPutObjHeaders(w, objInfo, false, r.Header)
 
 	// Notify object created event.
 	evt := eventArgs{
@@ -2728,22 +2449,6 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 			scheduleReplication(ctx, objInfo, objectAPI, dsc, replication.ObjectReplicationType)
 		}
 
-		asize, err := objInfo.GetActualSize()
-		if err != nil {
-			asize = objInfo.Size
-		}
-
-		defer globalCacheConfig.Set(&cache.ObjectInfo{
-			Key:          objInfo.Name,
-			Bucket:       objInfo.Bucket,
-			ETag:         objInfo.ETag,
-			ModTime:      objInfo.ModTime,
-			Expires:      objInfo.ExpiresStr(),
-			CacheControl: objInfo.CacheControl,
-			Size:         asize,
-			Metadata:     cleanReservedKeys(objInfo.UserDefined),
-		})
-
 		// Notify object created event.
 		evt := eventArgs{
 			EventName:    event.ObjectCreatedPut,
@@ -2941,9 +2646,7 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	defer globalCacheConfig.Delete(bucket, object)
-
-	setPutObjHeaders(w, objInfo, true)
+	setPutObjHeaders(w, objInfo, true, r.Header)
 	writeSuccessNoContent(w)
 
 	eventName := event.ObjectRemovedDelete
@@ -3361,11 +3064,11 @@ func (api objectAPIHandlers) GetObjectTaggingHandler(w http.ResponseWriter, r *h
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
-				globalReplicationStats.incProxy(bucket, getObjectTaggingAPI, false)
+				globalReplicationStats.Load().incProxy(bucket, getObjectTaggingAPI, false)
 				// proxy to replication target if site replication is in place.
 				tags, gerr := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
 				if gerr.Err != nil || tags == nil {
-					globalReplicationStats.incProxy(bucket, getObjectTaggingAPI, true)
+					globalReplicationStats.Load().incProxy(bucket, getObjectTaggingAPI, true)
 					writeErrorResponse(ctx, w, toAPIError(ctx, gerr.Err), r.URL)
 					return
 				} // overlay tags from peer site.
@@ -3464,11 +3167,11 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
-				globalReplicationStats.incProxy(bucket, putObjectTaggingAPI, false)
+				globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, false)
 				// proxy to replication target if site replication is in place.
 				perr := proxyTaggingToRepTarget(ctx, bucket, object, tags, opts, proxytgts)
 				if perr.Err != nil {
-					globalReplicationStats.incProxy(bucket, putObjectTaggingAPI, true)
+					globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, true)
 					writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
 					return
 				}
@@ -3561,11 +3264,11 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
-				globalReplicationStats.incProxy(bucket, removeObjectTaggingAPI, false)
+				globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, false)
 				// proxy to replication target if active-active replication is in place.
 				perr := proxyTaggingToRepTarget(ctx, bucket, object, nil, opts, proxytgts)
 				if perr.Err != nil {
-					globalReplicationStats.incProxy(bucket, removeObjectTaggingAPI, true)
+					globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, true)
 					writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
 					return
 				}

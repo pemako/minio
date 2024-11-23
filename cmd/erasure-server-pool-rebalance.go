@@ -110,22 +110,14 @@ var errRebalanceNotStarted = errors.New("rebalance not started")
 
 func (z *erasureServerPools) loadRebalanceMeta(ctx context.Context) error {
 	r := &rebalanceMeta{}
-	err := r.load(ctx, z.serverPools[0])
-	if err != nil {
-		if errors.Is(err, errConfigNotFound) {
-			return nil
-		}
-		return err
-	}
-
-	z.rebalMu.Lock()
-	if len(r.PoolStats) == len(z.serverPools) {
+	if err := r.load(ctx, z.serverPools[0]); err == nil {
+		z.rebalMu.Lock()
 		z.rebalMeta = r
-	} else {
 		z.updateRebalanceStats(ctx)
+		z.rebalMu.Unlock()
+	} else if !errors.Is(err, errConfigNotFound) {
+		rebalanceLogIf(ctx, fmt.Errorf("failed to load rebalance metadata, continue to restart rebalance as needed: %w", err))
 	}
-	z.rebalMu.Unlock()
-
 	return nil
 }
 
@@ -147,24 +139,16 @@ func (z *erasureServerPools) updateRebalanceStats(ctx context.Context) error {
 		}
 	}
 	if ok {
-		lock := z.serverPools[0].NewNSLock(minioMetaBucket, rebalMetaName)
-		lkCtx, err := lock.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			rebalanceLogIf(ctx, fmt.Errorf("failed to acquire write lock on %s/%s: %w", minioMetaBucket, rebalMetaName, err))
-			return err
-		}
-		defer lock.Unlock(lkCtx)
-
-		ctx = lkCtx.Context()
-
-		noLockOpts := ObjectOptions{NoLock: true}
-		return z.rebalMeta.saveWithOpts(ctx, z.serverPools[0], noLockOpts)
+		return z.rebalMeta.save(ctx, z.serverPools[0])
 	}
 
 	return nil
 }
 
 func (z *erasureServerPools) findIndex(index int) int {
+	if z.rebalMeta == nil {
+		return 0
+	}
 	for i := 0; i < len(z.rebalMeta.PoolStats); i++ {
 		if i == index {
 			return index
@@ -277,6 +261,10 @@ func (z *erasureServerPools) bucketRebalanceDone(bucket string, poolIdx int) {
 	z.rebalMu.Lock()
 	defer z.rebalMu.Unlock()
 
+	if z.rebalMeta == nil {
+		return
+	}
+
 	ps := z.rebalMeta.PoolStats[poolIdx]
 	if ps == nil {
 		return
@@ -331,6 +319,10 @@ func (r *rebalanceMeta) loadWithOpts(ctx context.Context, store objectIO, opts O
 }
 
 func (r *rebalanceMeta) saveWithOpts(ctx context.Context, store objectIO, opts ObjectOptions) error {
+	if r == nil {
+		return nil
+	}
+
 	data := make([]byte, 4, r.Msgsize()+4)
 
 	// Initialize the header.
@@ -353,8 +345,15 @@ func (z *erasureServerPools) IsRebalanceStarted() bool {
 	z.rebalMu.RLock()
 	defer z.rebalMu.RUnlock()
 
-	if r := z.rebalMeta; r != nil {
-		if r.StoppedAt.IsZero() {
+	r := z.rebalMeta
+	if r == nil {
+		return false
+	}
+	if !r.StoppedAt.IsZero() {
+		return false
+	}
+	for _, ps := range r.PoolStats {
+		if ps.Participating && ps.Info.Status != rebalCompleted {
 			return true
 		}
 	}
@@ -369,7 +368,7 @@ func (z *erasureServerPools) IsPoolRebalancing(poolIndex int) bool {
 		if !r.StoppedAt.IsZero() {
 			return false
 		}
-		ps := z.rebalMeta.PoolStats[poolIndex]
+		ps := r.PoolStats[poolIndex]
 		return ps.Participating && ps.Info.Status == rebalStarted
 	}
 	return false
@@ -427,7 +426,7 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 
 			stopFn := globalRebalanceMetrics.log(rebalanceMetricSaveMetadata, poolIdx, traceMsg)
 			err := z.saveRebalanceStats(GlobalContext, poolIdx, rebalSaveStats)
-			stopFn(err)
+			stopFn(0, err)
 			rebalanceLogIf(GlobalContext, err)
 
 			if quit {
@@ -456,7 +455,7 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 
 		stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceBucket, poolIdx, bucket)
 		if err = z.rebalanceBucket(ctx, bucket, poolIdx); err != nil {
-			stopFn(err)
+			stopFn(0, err)
 			if errors.Is(err, errServerNotInitialized) || errors.Is(err, errBucketMetadataNotInitialized) {
 				continue
 			}
@@ -464,7 +463,7 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 			doneCh <- err
 			return
 		}
-		stopFn(nil)
+		stopFn(0, nil)
 		z.bucketRebalanceDone(bucket, poolIdx)
 	}
 
@@ -622,14 +621,18 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 
 			var rebalanced, expired int
 			for _, version := range fivs.Versions {
+				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
+
 				// Skip transitioned objects for now. TBD
 				if version.IsRemote() {
+					stopFn(version.Size, errors.New("ILM Tiered version will be skipped for now"))
 					continue
 				}
 
 				// Apply lifecycle rules on the objects that are expired.
 				if filterLifecycle(bucket, version.Name, version) {
 					expired++
+					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
 
@@ -639,6 +642,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 				remainingVersions := len(fivs.Versions) - expired
 				if version.Deleted && remainingVersions == 1 {
 					rebalanced++
+					stopFn(version.Size, errors.New("DELETE marked object with no other non-current versions will be skipped"))
 					continue
 				}
 
@@ -647,6 +651,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					versionID = nullVersionID
 				}
 
+				var failure, ignore bool
 				if version.Deleted {
 					_, err := z.DeleteObject(ctx,
 						bucket,
@@ -656,16 +661,26 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 							VersionID:         versionID,
 							MTime:             version.ModTime,
 							DeleteReplication: version.ReplicationState,
+							SrcPoolIdx:        poolIdx,
+							DataMovement:      true,
 							DeleteMarker:      true, // make sure we create a delete marker
 							SkipRebalancing:   true, // make sure we skip the decommissioned pool
 							NoAuditLog:        true,
 						})
-					var failure bool
-					if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-						rebalanceLogIf(ctx, err)
-						failure = true
+					// This can happen when rebalance stop races with ongoing rebalance workers.
+					// These rebalance failures can be ignored.
+					if err != nil {
+						// This can happen when rebalance stop races with ongoing rebalance workers.
+						// These rebalance failures can be ignored.
+						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+							ignore = true
+							stopFn(0, nil)
+							continue
+						}
 					}
-
+					stopFn(version.Size, err)
+					rebalanceLogIf(ctx, err)
+					failure = err != nil
 					if !failure {
 						z.updatePoolStats(poolIdx, bucket, version)
 						rebalanced++
@@ -674,10 +689,8 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					continue
 				}
 
-				var failure, ignore bool
 				for try := 0; try < 3; try++ {
 					// GetObjectReader.Close is called by rebalanceObject
-					stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
 					gr, err := set.GetObjectNInfo(ctx,
 						bucket,
 						encodeDirObject(version.Name),
@@ -692,24 +705,31 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 						// object deleted by the application, nothing to do here we move on.
 						ignore = true
-						stopFn(nil)
+						stopFn(0, nil)
 						break
 					}
 					if err != nil {
 						failure = true
 						rebalanceLogIf(ctx, err)
-						stopFn(err)
+						stopFn(0, err)
 						continue
 					}
 
-					if err = z.rebalanceObject(ctx, bucket, gr); err != nil {
+					if err = z.rebalanceObject(ctx, poolIdx, bucket, gr); err != nil {
+						// This can happen when rebalance stop races with ongoing rebalance workers.
+						// These rebalance failures can be ignored.
+						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+							ignore = true
+							stopFn(0, nil)
+							break
+						}
 						failure = true
 						rebalanceLogIf(ctx, err)
-						stopFn(err)
+						stopFn(version.Size, err)
 						continue
 					}
 
-					stopFn(nil)
+					stopFn(version.Size, nil)
 					failure = false
 					break
 				}
@@ -735,7 +755,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 						NoAuditLog:         true,
 					},
 				)
-				stopFn(err)
+				stopFn(0, err)
 				auditLogRebalance(ctx, "Rebalance:DeleteObject", bucket, entry.name, "", err)
 				if err != nil {
 					rebalanceLogIf(ctx, err)
@@ -794,7 +814,9 @@ func (z *erasureServerPools) saveRebalanceStats(ctx context.Context, poolIdx int
 	case rebalSaveStoppedAt:
 		r.StoppedAt = time.Now()
 	case rebalSaveStats:
-		r.PoolStats[poolIdx] = z.rebalMeta.PoolStats[poolIdx]
+		if z.rebalMeta != nil {
+			r.PoolStats[poolIdx] = z.rebalMeta.PoolStats[poolIdx]
+		}
 	}
 	z.rebalMeta = r
 
@@ -816,7 +838,7 @@ func auditLogRebalance(ctx context.Context, apiName, bucket, object, versionID s
 	})
 }
 
-func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string, gr *GetObjectReader) (err error) {
+func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, bucket string, gr *GetObjectReader) (err error) {
 	oi := gr.ObjInfo
 
 	defer func() {
@@ -831,9 +853,11 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 
 	if oi.isMultipart() {
 		res, err := z.NewMultipartUpload(ctx, bucket, oi.Name, ObjectOptions{
-			VersionID:   oi.VersionID,
-			UserDefined: oi.UserDefined,
-			NoAuditLog:  true,
+			VersionID:    oi.VersionID,
+			UserDefined:  oi.UserDefined,
+			NoAuditLog:   true,
+			DataMovement: true,
+			SrcPoolIdx:   poolIdx,
 		})
 		if err != nil {
 			return fmt.Errorf("rebalanceObject: NewMultipartUpload() %w", err)
@@ -885,6 +909,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, bucket string,
 		oi.Name,
 		NewPutObjReader(hr),
 		ObjectOptions{
+			SrcPoolIdx:   poolIdx,
 			DataMovement: true,
 			VersionID:    oi.VersionID,
 			MTime:        oi.ModTime,
@@ -935,7 +960,7 @@ func (z *erasureServerPools) StartRebalance() {
 		go func(idx int) {
 			stopfn := globalRebalanceMetrics.log(rebalanceMetricRebalanceBuckets, idx)
 			err := z.rebalanceBuckets(ctx, idx)
-			stopfn(err)
+			stopfn(0, err)
 		}(poolIdx)
 	}
 }
@@ -975,7 +1000,9 @@ const (
 	rebalanceMetricSaveMetadata
 )
 
-func rebalanceTrace(r rebalanceMetric, poolIdx int, startTime time.Time, duration time.Duration, err error, path string) madmin.TraceInfo {
+var errDataMovementSrcDstPoolSame = errors.New("source and destination pool are the same")
+
+func rebalanceTrace(r rebalanceMetric, poolIdx int, startTime time.Time, duration time.Duration, err error, path string, sz int64) madmin.TraceInfo {
 	var errStr string
 	if err != nil {
 		errStr = err.Error()
@@ -988,15 +1015,16 @@ func rebalanceTrace(r rebalanceMetric, poolIdx int, startTime time.Time, duratio
 		Duration:  duration,
 		Path:      path,
 		Error:     errStr,
+		Bytes:     sz,
 	}
 }
 
-func (p *rebalanceMetrics) log(r rebalanceMetric, poolIdx int, paths ...string) func(err error) {
+func (p *rebalanceMetrics) log(r rebalanceMetric, poolIdx int, paths ...string) func(sz int64, err error) {
 	startTime := time.Now()
-	return func(err error) {
+	return func(sz int64, err error) {
 		duration := time.Since(startTime)
 		if globalTrace.NumSubscribers(madmin.TraceRebalance) > 0 {
-			globalTrace.Publish(rebalanceTrace(r, poolIdx, startTime, duration, err, strings.Join(paths, " ")))
+			globalTrace.Publish(rebalanceTrace(r, poolIdx, startTime, duration, err, strings.Join(paths, " "), sz))
 		}
 	}
 }

@@ -26,6 +26,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,8 +43,6 @@ import (
 )
 
 const (
-	// Timeout for the webhook http call
-	webhookCallTimeout = 3 * time.Second
 
 	// maxWorkers is the maximum number of concurrent http loggers
 	maxWorkers = 16
@@ -67,18 +67,21 @@ var (
 
 // Config http logger target
 type Config struct {
-	Enabled    bool              `json:"enabled"`
-	Name       string            `json:"name"`
-	UserAgent  string            `json:"userAgent"`
-	Endpoint   *xnet.URL         `json:"endpoint"`
-	AuthToken  string            `json:"authToken"`
-	ClientCert string            `json:"clientCert"`
-	ClientKey  string            `json:"clientKey"`
-	BatchSize  int               `json:"batchSize"`
-	QueueSize  int               `json:"queueSize"`
-	QueueDir   string            `json:"queueDir"`
-	Proxy      string            `json:"string"`
-	Transport  http.RoundTripper `json:"-"`
+	Enabled     bool              `json:"enabled"`
+	Name        string            `json:"name"`
+	UserAgent   string            `json:"userAgent"`
+	Endpoint    *xnet.URL         `json:"endpoint"`
+	AuthToken   string            `json:"authToken"`
+	ClientCert  string            `json:"clientCert"`
+	ClientKey   string            `json:"clientKey"`
+	BatchSize   int               `json:"batchSize"`
+	QueueSize   int               `json:"queueSize"`
+	QueueDir    string            `json:"queueDir"`
+	MaxRetry    int               `json:"maxRetry"`
+	RetryIntvl  time.Duration     `json:"retryInterval"`
+	Proxy       string            `json:"string"`
+	Transport   http.RoundTripper `json:"-"`
+	HTTPTimeout time.Duration     `json:"httpTimeout"`
 
 	// Custom logger
 	LogOnceIf func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
@@ -90,13 +93,14 @@ type Config struct {
 // buffer is full, new logs are just ignored and an error
 // is returned to the caller.
 type Target struct {
-	totalMessages  int64
-	failedMessages int64
-	status         int32
+	totalMessages  atomic.Int64
+	failedMessages atomic.Int64
+	status         atomic.Int32
 
 	// Worker control
-	workers    int64
+	workers    atomic.Int64
 	maxWorkers int64
+
 	// workerStartMu sync.Mutex
 	lastStarted time.Time
 
@@ -132,8 +136,9 @@ type Target struct {
 
 	initQueueOnce once.Init
 
-	config Config
-	client *http.Client
+	config      Config
+	client      *http.Client
+	httpTimeout time.Duration
 }
 
 // Name returns the name of the target
@@ -157,7 +162,7 @@ func (h *Target) String() string {
 
 // IsOnline returns true if the target is reachable using a cached value
 func (h *Target) IsOnline(ctx context.Context) bool {
-	return atomic.LoadInt32(&h.status) == statusOnline
+	return h.status.Load() == statusOnline
 }
 
 // Stats returns the target statistics.
@@ -166,8 +171,8 @@ func (h *Target) Stats() types.TargetStats {
 	queueLength := len(h.logCh)
 	h.logChMu.RUnlock()
 	stats := types.TargetStats{
-		TotalMessages:  atomic.LoadInt64(&h.totalMessages),
-		FailedMessages: atomic.LoadInt64(&h.failedMessages),
+		TotalMessages:  h.totalMessages.Load(),
+		FailedMessages: h.failedMessages.Load(),
 		QueueLength:    queueLength,
 	}
 
@@ -193,7 +198,20 @@ func (h *Target) initDiskStore(ctx context.Context) (err error) {
 	h.storeCtxCancel = cancel
 	h.lastStarted = time.Now()
 	go h.startQueueProcessor(ctx, true)
+
+	queueStore := store.NewQueueStore[interface{}](
+		filepath.Join(h.config.QueueDir, h.Name()),
+		uint64(h.config.QueueSize),
+		httpLoggerExtension,
+	)
+
+	if err := queueStore.Open(); err != nil {
+		return fmt.Errorf("unable to initialize the queue store of %s webhook: %w", h.Name(), err)
+	}
+
+	h.store = queueStore
 	store.StreamItems(h.store, h, ctx.Done(), h.config.LogOnceIf)
+
 	return nil
 }
 
@@ -205,17 +223,21 @@ func (h *Target) initMemoryStore(ctx context.Context) (err error) {
 	return nil
 }
 
-func (h *Target) send(ctx context.Context, payload []byte, payloadType string, timeout time.Duration) (err error) {
+func (h *Target) send(ctx context.Context, payload []byte, payloadCount int, payloadType string, timeout time.Duration) (err error) {
 	defer func() {
 		if err != nil {
-			atomic.StoreInt32(&h.status, statusOffline)
+			if xnet.IsNetworkOrHostDown(err, false) {
+				h.status.Store(statusOffline)
+			}
+			h.failedMessages.Add(int64(payloadCount))
 		} else {
-			atomic.StoreInt32(&h.status, statusOnline)
+			h.status.Store(statusOnline)
 		}
 	}()
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		h.Endpoint(), bytes.NewReader(payload))
 	if err != nil {
@@ -224,6 +246,7 @@ func (h *Target) send(ctx context.Context, payload []byte, payloadType string, t
 	if payloadType != "" {
 		req.Header.Set(xhttp.ContentType, payloadType)
 	}
+	req.Header.Set(xhttp.WebhookEventPayloadCount, strconv.Itoa(payloadCount))
 	req.Header.Set(xhttp.MinIOVersion, xhttp.GlobalMinIOVersion)
 	req.Header.Set(xhttp.MinioDeploymentID, xhttp.GlobalDeploymentID)
 
@@ -243,15 +266,13 @@ func (h *Target) send(ctx context.Context, payload []byte, payloadType string, t
 	// Drain any response.
 	xhttp.DrainBody(resp.Body)
 
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent:
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 		// accepted HTTP status codes.
 		return nil
-	case http.StatusForbidden:
+	} else if resp.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("%s returned '%s', please check if your auth token is correctly set", h.Endpoint(), resp.Status)
-	default:
-		return fmt.Errorf("%s returned '%s', please check your endpoint configuration", h.Endpoint(), resp.Status)
 	}
+	return fmt.Errorf("%s returned '%s', please check your endpoint configuration", h.Endpoint(), resp.Status)
 }
 
 func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
@@ -262,8 +283,8 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 	}
 	h.logChMu.RUnlock()
 
-	atomic.AddInt64(&h.workers, 1)
-	defer atomic.AddInt64(&h.workers, -1)
+	h.workers.Add(1)
+	defer h.workers.Add(-1)
 
 	h.wg.Add(1)
 	defer h.wg.Done()
@@ -305,19 +326,13 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 		}
 	}()
 
-	var entry interface{}
-	var ok bool
-	var err error
 	lastBatchProcess := time.Now()
 
 	buf := bytebufferpool.Get()
 	enc := jsoniter.ConfigCompatibleWithStandardLibrary.NewEncoder(buf)
 	defer bytebufferpool.Put(buf)
 
-	isDirQueue := false
-	if h.config.QueueDir != "" {
-		isDirQueue = true
-	}
+	isDirQueue := h.config.QueueDir != ""
 
 	// globalBuffer is always created or adjusted
 	// before this method is launched.
@@ -325,57 +340,75 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 	globalBuffer := logChBuffers[name]
 	logChLock.Unlock()
 
-	newTicker := time.NewTicker(time.Second)
-	isTick := false
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
+	var count int
 	for {
-		isTick = false
-		select {
-		case _ = <-newTicker.C:
-			isTick = true
-		case entry, _ = <-globalBuffer:
-		case entry, ok = <-h.logCh:
-			if !ok {
+		var (
+			ok    bool
+			entry any
+		)
+
+		if count < h.batchSize {
+			tickered := false
+			select {
+			case _ = <-ticker.C:
+				tickered = true
+			case entry, _ = <-globalBuffer:
+			case entry, ok = <-h.logCh:
+				if !ok {
+					return
+				}
+			case <-ctx.Done():
 				return
 			}
-		case <-ctx.Done():
-			return
-		}
 
-		if !isTick {
-			atomic.AddInt64(&h.totalMessages, 1)
-
-			if !isDirQueue {
-				if err := enc.Encode(&entry); err != nil {
-					h.config.LogOnceIf(
-						ctx,
-						fmt.Errorf("unable to encode webhook log entry, err  '%w' entry: %v\n", err, entry),
-						h.Name(),
-					)
-					atomic.AddInt64(&h.failedMessages, 1)
-					continue
+			if !tickered {
+				h.totalMessages.Add(1)
+				if !isDirQueue {
+					if err := enc.Encode(&entry); err != nil {
+						h.config.LogOnceIf(
+							ctx,
+							fmt.Errorf("unable to encode webhook log entry, err  '%w' entry: %v\n", err, entry),
+							h.Name(),
+						)
+						h.failedMessages.Add(1)
+						continue
+					}
+				} else {
+					entries = append(entries, entry)
 				}
+				count++
 			}
 
-			entries = append(entries, entry)
-		}
-
-		if len(entries) != h.batchSize {
-			if len(h.logCh) > 0 || len(globalBuffer) > 0 || len(entries) == 0 {
+			if len(h.logCh) > 0 || len(globalBuffer) > 0 || count == 0 {
+				// there is something in the log queue
+				// process it first, even if we tickered
+				// first, or we have not received any events
+				// yet, still wait on it.
 				continue
 			}
 
-			if h.batchSize > 1 {
-				// If we are doing batching, we should wait
-				// at least one second before sending.
-				// Even if there is nothing in the queue.
-				if time.Since(lastBatchProcess).Seconds() < 1 {
-					continue
-				}
+			// If we are doing batching, we should wait
+			// at least for a second, before sending.
+			// Even if there is nothing in the queue.
+			if h.batchSize > 1 && time.Since(lastBatchProcess) < time.Second {
+				continue
 			}
 		}
 
+		// if we have reached the count send at once
+		// or we have crossed last second before batch was sent, send at once
 		lastBatchProcess = time.Now()
+
+		var retries int
+		retryIntvl := h.config.RetryIntvl
+		if retryIntvl <= 0 {
+			retryIntvl = 3 * time.Second
+		}
+
+		maxRetries := h.config.MaxRetry
 
 	retry:
 		// If the channel reaches above half capacity
@@ -385,7 +418,7 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 		// and when it's been at least 30 seconds since
 		// we launched a new worker.
 		if mainWorker && len(h.logCh) > cap(h.logCh)/2 {
-			nWorkers := atomic.LoadInt64(&h.workers)
+			nWorkers := h.workers.Load()
 			if nWorkers < h.maxWorkers {
 				if time.Since(h.lastStarted).Milliseconds() > 10 {
 					h.lastStarted = time.Now()
@@ -394,30 +427,36 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 			}
 		}
 
+		var err error
 		if !isDirQueue {
-			err = h.send(ctx, buf.Bytes(), h.payloadType, webhookCallTimeout)
+			err = h.send(ctx, buf.Bytes(), count, h.payloadType, h.httpTimeout)
 		} else {
-			err = h.store.PutMultiple(entries)
+			_, err = h.store.PutMultiple(entries)
 		}
 
 		if err != nil {
-
-			h.config.LogOnceIf(
-				context.Background(),
-				fmt.Errorf("unable to send webhook log entry to '%s' err '%w'", name, err),
-				name,
-			)
-
 			if errors.Is(err, context.Canceled) {
 				return
 			}
 
-			time.Sleep(3 * time.Second)
-			goto retry
+			h.config.LogOnceIf(
+				context.Background(),
+				fmt.Errorf("unable to send audit/log entry(s) to '%s' err '%w': %d", name, err, count),
+				name,
+			)
+
+			time.Sleep(retryIntvl)
+			if maxRetries == 0 {
+				goto retry
+			}
+			retries++
+			if retries <= maxRetries {
+				goto retry
+			}
 		}
 
 		entries = make([]interface{}, 0)
-
+		count = 0
 		if !isDirQueue {
 			buf.Reset()
 		}
@@ -481,12 +520,13 @@ func New(config Config) (*Target, error) {
 	}
 
 	h := &Target{
-		logCh:      make(chan interface{}, config.QueueSize),
-		config:     config,
-		status:     statusOffline,
-		batchSize:  config.BatchSize,
-		maxWorkers: int64(maxWorkers),
+		logCh:       make(chan interface{}, config.QueueSize),
+		config:      config,
+		batchSize:   config.BatchSize,
+		maxWorkers:  int64(maxWorkers),
+		httpTimeout: config.HTTPTimeout,
 	}
+	h.status.Store(statusOffline)
 
 	if config.BatchSize > 1 {
 		h.payloadType = ""
@@ -504,30 +544,13 @@ func New(config Config) (*Target, error) {
 	}
 
 	h.client = &http.Client{Transport: h.config.Transport}
-
-	if h.config.QueueDir != "" {
-
-		queueStore := store.NewQueueStore[interface{}](
-			filepath.Join(h.config.QueueDir, h.Name()),
-			uint64(h.config.QueueSize),
-			httpLoggerExtension,
-		)
-
-		if err := queueStore.Open(); err != nil {
-			return h, fmt.Errorf("unable to initialize the queue store of %s webhook: %w", h.Name(), err)
-		}
-
-		h.store = queueStore
-
-	}
-
 	return h, nil
 }
 
 // SendFromStore - reads the log from store and sends it to webhook.
 func (h *Target) SendFromStore(key store.Key) (err error) {
 	var eventData []byte
-	eventData, err = h.store.GetRaw(key.Name)
+	eventData, err = h.store.GetRaw(key)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -535,19 +558,28 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 		return err
 	}
 
-	if err := h.send(context.Background(), eventData, h.payloadType, webhookCallTimeout); err != nil {
-		atomic.AddInt64(&h.failedMessages, 1)
+	count := 1
+	v := strings.Split(key.Name, ":")
+	if len(v) == 2 {
+		count, err = strconv.Atoi(v[0])
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := h.send(context.Background(), eventData, count, h.payloadType, h.httpTimeout); err != nil {
 		return err
 	}
+
 	// Delete the event from store.
-	return h.store.Del(key.Name)
+	return h.store.Del(key)
 }
 
 // Send the log message 'entry' to the http target.
 // Messages are queued in the disk if the store is enabled
 // If Cancel has been called the message is ignored.
 func (h *Target) Send(ctx context.Context, entry interface{}) error {
-	if atomic.LoadInt32(&h.status) == statusClosed {
+	if h.status.Load() == statusClosed {
 		if h.migrateTarget != nil {
 			return h.migrateTarget.Send(ctx, entry)
 		}
@@ -561,10 +593,9 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 		return nil
 	}
 
-retry:
 	select {
 	case h.logCh <- entry:
-		atomic.AddInt64(&h.totalMessages, 1)
+		h.totalMessages.Add(1)
 	case <-ctx.Done():
 		// return error only for context timedout.
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -572,11 +603,8 @@ retry:
 		}
 		return nil
 	default:
-		if h.workers < h.maxWorkers {
-			goto retry
-		}
-		atomic.AddInt64(&h.totalMessages, 1)
-		atomic.AddInt64(&h.failedMessages, 1)
+		h.totalMessages.Add(1)
+		h.failedMessages.Add(1)
 		return errors.New("log buffer full")
 	}
 
@@ -587,7 +615,7 @@ retry:
 // All queued messages are flushed and the function returns afterwards.
 // All messages sent to the target after this function has been called will be dropped.
 func (h *Target) Cancel() {
-	atomic.StoreInt32(&h.status, statusClosed)
+	h.status.Store(statusClosed)
 	h.storeCtxCancel()
 
 	// Wait for messages to be sent...

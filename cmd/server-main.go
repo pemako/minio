@@ -84,11 +84,12 @@ var ServerFlags = []cli.Flag{
 	},
 	cli.DurationFlag{
 		Name:   "shutdown-timeout",
-		Value:  xhttp.DefaultShutdownTimeout,
-		Usage:  "shutdown timeout to gracefully shutdown server",
+		Value:  time.Second * 30,
+		Usage:  "shutdown timeout to gracefully shutdown server (DEPRECATED)",
 		EnvVar: "MINIO_SHUTDOWN_TIMEOUT",
 		Hidden: true,
 	},
+
 	cli.DurationFlag{
 		Name:   "idle-timeout",
 		Value:  xhttp.DefaultIdleTimeout,
@@ -414,11 +415,13 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 	setGlobalInternodeInterface(ctxt.Interface)
 
 	globalTCPOptions = xhttp.TCPOptions{
-		UserTimeout:    int(ctxt.UserTimeout.Milliseconds()),
-		DriveOPTimeout: globalDriveConfig.GetOPTimeout,
-		Interface:      ctxt.Interface,
-		SendBufSize:    ctxt.SendBufSize,
-		RecvBufSize:    ctxt.RecvBufSize,
+		UserTimeout: int(ctxt.UserTimeout.Milliseconds()),
+		// FIXME: Bring this back when we have valid way to handle deadlines
+		//		DriveOPTimeout: globalDriveConfig.GetOPTimeout,
+		Interface:   ctxt.Interface,
+		SendBufSize: ctxt.SendBufSize,
+		RecvBufSize: ctxt.RecvBufSize,
+		IdleTimeout: ctxt.IdleTimeout,
 	}
 
 	// allow transport to be HTTP/1.1 for proxying.
@@ -430,7 +433,7 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 		RoundTripper: globalRemoteTargetTransport,
 		Logger: func(err error) {
 			if err != nil && !errors.Is(err, context.Canceled) {
-				replLogIf(GlobalContext, err)
+				proxyLogIf(GlobalContext, err)
 			}
 		},
 	})
@@ -679,10 +682,8 @@ func getServerListenAddrs() []string {
 	// Use a string set to avoid duplication
 	addrs := set.NewStringSet()
 	// Listen on local interface to receive requests from Console
-	for _, ip := range mustGetLocalIPs() {
-		if ip != nil && ip.IsLoopback() {
-			addrs.Add(net.JoinHostPort(ip.String(), globalMinioPort))
-		}
+	for _, ip := range localLoopbacks.ToSlice() {
+		addrs.Add(net.JoinHostPort(ip, globalMinioPort))
 	}
 	host, _ := mustSplitHostPort(globalMinioAddr)
 	if host != "" {
@@ -739,6 +740,8 @@ func initializeLogRotate(ctx *cli.Context) (io.WriteCloser, error) {
 
 // serverMain handler called for 'minio server' command.
 func serverMain(ctx *cli.Context) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	var warnings []string
 
 	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
@@ -770,6 +773,9 @@ func serverMain(ctx *cli.Context) {
 
 	// Always load ENV variables from files first.
 	loadEnvVarsFromFiles()
+
+	// Handle early server environment vars
+	serverHandleEarlyEnvVars()
 
 	// Handle all server command args and build the disks layout
 	bootstrapTrace("serverHandleCmdArgs", func() {
@@ -834,23 +840,29 @@ func serverMain(ctx *cli.Context) {
 
 	// Set system resources to maximum.
 	bootstrapTrace("setMaxResources", func() {
-		_ = setMaxResources(ctx)
+		_ = setMaxResources(globalServerCtxt)
 	})
 
 	// Verify kernel release and version.
 	if oldLinux() {
-		warnings = append(warnings, color.YellowBold("- Detected Linux kernel version older than 4.0.0 release, there are some known potential performance problems with this kernel version. MinIO recommends a minimum of 4.x.x linux kernel version for best performance"))
+		warnings = append(warnings, color.YellowBold("Detected Linux kernel version older than 4.0 release, there are some known potential performance problems with this kernel version. MinIO recommends a minimum of 4.x linux kernel version for best performance"))
 	}
 
 	maxProcs := runtime.GOMAXPROCS(0)
 	cpuProcs := runtime.NumCPU()
 	if maxProcs < cpuProcs {
-		warnings = append(warnings, color.YellowBold("- Detected GOMAXPROCS(%d) < NumCPU(%d), please make sure to provide all PROCS to MinIO for optimal performance", maxProcs, cpuProcs))
+		warnings = append(warnings, color.YellowBold("Detected GOMAXPROCS(%d) < NumCPU(%d), please make sure to provide all PROCS to MinIO for optimal performance",
+			maxProcs, cpuProcs))
 	}
 
 	// Initialize grid
 	bootstrapTrace("initGrid", func() {
 		logger.FatalIf(initGlobalGrid(GlobalContext, globalEndpoints), "Unable to configure server grid RPC services")
+	})
+
+	// Initialize lock grid
+	bootstrapTrace("initLockGrid", func() {
+		logger.FatalIf(initGlobalLockGrid(GlobalContext, globalEndpoints), "Unable to configure server lock grid RPC services")
 	})
 
 	// Configure server.
@@ -860,13 +872,15 @@ func serverMain(ctx *cli.Context) {
 			logger.Fatal(config.ErrUnexpectedError(err), "Unable to configure one of server's RPC services")
 		}
 		// Allow grid to start after registering all services.
-		xioutil.SafeClose(globalGridStart)
+		close(globalGridStart)
+		close(globalLockGridStart)
 
 		httpServer := xhttp.NewServer(getServerListenAddrs()).
 			UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 			UseTLSConfig(newTLSConfig(getCert)).
-			UseShutdownTimeout(globalServerCtxt.ShutdownTimeout).
 			UseIdleTimeout(globalServerCtxt.IdleTimeout).
+			UseReadTimeout(24 * time.Hour).  // (overridden by listener.config.IdleTimeout on requests)
+			UseWriteTimeout(24 * time.Hour). // (overridden by listener.config.IdleTimeout on requests)
 			UseReadHeaderTimeout(globalServerCtxt.ReadHeaderTimeout).
 			UseBaseContext(GlobalContext).
 			UseCustomLogger(log.New(io.Discard, "", 0)). // Turn-off random logging by Go stdlib
@@ -896,7 +910,7 @@ func serverMain(ctx *cli.Context) {
 		})
 	}
 
-	if !globalDisableFreezeOnBoot {
+	if globalEnableSyncBoot {
 		// Freeze the services until the bucket notification subsystem gets initialized.
 		bootstrapTrace("freezeServices", freezeServices)
 	}
@@ -919,6 +933,22 @@ func serverMain(ctx *cli.Context) {
 		globalNodeNamesHex[hex.EncodeToString(nodeNameSum[:])] = struct{}{}
 	}
 
+	bootstrapTrace("waitForQuorum", func() {
+		result := newObject.Health(context.Background(), HealthOptions{NoLogging: true})
+		for !result.HealthyRead {
+			if debugNoExit {
+				logger.Info("Not waiting for quorum since we are debugging.. possible cause unhealthy sets")
+				logger.Info(result.String())
+				break
+			}
+			d := time.Duration(r.Float64() * float64(time.Second))
+			logger.Info("Waiting for quorum READ healthcheck to succeed retrying in %s.. possible cause unhealthy sets", d)
+			logger.Info(result.String())
+			time.Sleep(d)
+			result = newObject.Health(context.Background(), HealthOptions{NoLogging: true})
+		}
+	})
+
 	var err error
 	bootstrapTrace("initServerConfig", func() {
 		if err = initServerConfig(GlobalContext, newObject); err != nil {
@@ -938,11 +968,11 @@ func serverMain(ctx *cli.Context) {
 		}
 
 		if !globalServerCtxt.StrictS3Compat {
-			warnings = append(warnings, color.YellowBold("- Strict AWS S3 compatible incoming PUT, POST content payload validation is turned off, caution is advised do not use in production"))
+			warnings = append(warnings, color.YellowBold("Strict AWS S3 compatible incoming PUT, POST content payload validation is turned off, caution is advised do not use in production"))
 		}
 	})
 	if globalActiveCred.Equal(auth.DefaultCredentials) {
-		msg := fmt.Sprintf("- Detected default credentials '%s', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables",
+		msg := fmt.Sprintf("Detected default credentials '%s', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables",
 			globalActiveCred)
 		warnings = append(warnings, color.YellowBold(msg))
 	}
@@ -985,12 +1015,11 @@ func serverMain(ctx *cli.Context) {
 	}()
 
 	go func() {
-		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-		if !globalDisableFreezeOnBoot {
+		if globalEnableSyncBoot {
 			defer bootstrapTrace("unfreezeServices", unfreezeServices)
 			t := time.AfterFunc(5*time.Minute, func() {
-				warnings = append(warnings, color.YellowBold("- Initializing the config subsystem is taking longer than 5 minutes. Please set '_MINIO_DISABLE_API_FREEZE_ON_BOOT=true' to not freeze the APIs"))
+				warnings = append(warnings,
+					color.YellowBold("- Initializing the config subsystem is taking longer than 5 minutes. Please remove 'MINIO_SYNC_BOOT=on' to not freeze the APIs"))
 			})
 			defer t.Stop()
 		}
@@ -1016,16 +1045,6 @@ func serverMain(ctx *cli.Context) {
 			globalTransitionState.Init(newObject)
 		})
 
-		// Initialize batch job pool.
-		bootstrapTrace("newBatchJobPool", func() {
-			globalBatchJobPool = newBatchJobPool(GlobalContext, newObject, 100)
-		})
-
-		// Initialize the license update job
-		bootstrapTrace("initLicenseUpdateJob", func() {
-			initLicenseUpdateJob(GlobalContext, newObject)
-		})
-
 		go func() {
 			// Initialize transition tier configuration manager
 			bootstrapTrace("globalTierConfigMgr.Init", func() {
@@ -1040,11 +1059,11 @@ func serverMain(ctx *cli.Context) {
 			bootLogIf(GlobalContext, globalEventNotifier.InitBucketTargets(GlobalContext, newObject))
 		})
 
-		var buckets []BucketInfo
+		var buckets []string
 		// List buckets to initialize bucket metadata sub-sys.
 		bootstrapTrace("listBuckets", func() {
 			for {
-				buckets, err = newObject.ListBuckets(GlobalContext, BucketOptions{})
+				bucketsList, err := newObject.ListBuckets(GlobalContext, BucketOptions{NoMetadata: true})
 				if err != nil {
 					if configRetriableErrors(err) {
 						logger.Info("Waiting for list buckets to succeed to initialize buckets.. possible cause (%v)", err)
@@ -1054,6 +1073,10 @@ func serverMain(ctx *cli.Context) {
 					bootLogIf(GlobalContext, fmt.Errorf("Unable to list buckets to initialize bucket metadata sub-system: %w", err))
 				}
 
+				buckets = make([]string, len(bucketsList))
+				for i := range bucketsList {
+					buckets[i] = bucketsList[i].Name
+				}
 				break
 			}
 		})
@@ -1065,17 +1088,12 @@ func serverMain(ctx *cli.Context) {
 
 		// initialize replication resync state.
 		bootstrapTrace("initResync", func() {
-			globalReplicationPool.initResync(GlobalContext, buckets, newObject)
+			globalReplicationPool.Get().initResync(GlobalContext, buckets, newObject)
 		})
 
 		// Initialize site replication manager after bucket metadata
 		bootstrapTrace("globalSiteReplicationSys.Init", func() {
 			globalSiteReplicationSys.Init(GlobalContext, newObject)
-		})
-
-		// Initialize quota manager.
-		bootstrapTrace("globalBucketQuotaSys.Init", func() {
-			globalBucketQuotaSys.Init(newObject)
 		})
 
 		// Populate existing buckets to the etcd backend
@@ -1086,22 +1104,26 @@ func serverMain(ctx *cli.Context) {
 			})
 		}
 
+		// Initialize batch job pool.
+		bootstrapTrace("newBatchJobPool", func() {
+			globalBatchJobPool = newBatchJobPool(GlobalContext, newObject, 100)
+			globalBatchJobsMetrics = batchJobMetrics{
+				metrics: make(map[string]*batchJobInfo),
+			}
+			go globalBatchJobsMetrics.init(GlobalContext, newObject)
+			go globalBatchJobsMetrics.purgeJobMetrics()
+		})
+
 		// Prints the formatted startup message, if err is not nil then it prints additional information as well.
 		printStartupMessage(getAPIEndpoints(), err)
 
 		// Print a warning at the end of the startup banner so it is more noticeable
-		if newObject.BackendInfo().StandardSCParity == 0 {
-			warnings = append(warnings, color.YellowBold("- The standard parity is set to 0. This can lead to data loss."))
+		if newObject.BackendInfo().StandardSCParity == 0 && !globalIsErasureSD {
+			warnings = append(warnings, color.YellowBold("The standard parity is set to 0. This can lead to data loss."))
 		}
-		objAPI := newObjectLayerFn()
-		if objAPI != nil {
-			printStorageInfo(objAPI.StorageInfo(GlobalContext, true))
-		}
-		if len(warnings) > 0 {
-			logger.Info(color.Yellow("STARTUP WARNINGS:"))
-			for _, warn := range warnings {
-				logger.Info(warn)
-			}
+
+		for _, warn := range warnings {
+			logger.Warning(warn)
 		}
 	}()
 

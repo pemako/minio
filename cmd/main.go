@@ -107,6 +107,11 @@ func newApp(name string) *cli.App {
 
 	// registerCommand registers a cli command.
 	registerCommand := func(command cli.Command) {
+		// avoid registering commands which are not being built (via
+		// go:build tags)
+		if command.Name == "" {
+			return
+		}
 		commands = append(commands, command)
 		commandsTree.Insert(command.Name)
 	}
@@ -134,6 +139,7 @@ func newApp(name string) *cli.App {
 
 	// Register all commands.
 	registerCommand(serverCmd)
+	registerCommand(fmtGenCmd)
 
 	// Set up app.
 	cli.HelpFlag = cli.BoolFlag{
@@ -189,12 +195,14 @@ func printMinIOVersion(c *cli.Context) {
 	io.Copy(c.App.Writer, versionBanner(c))
 }
 
+var debugNoExit = env.Get("_MINIO_DEBUG_NO_EXIT", "") != ""
+
 // Main main for minio server.
 func Main(args []string) {
 	// Set the minio app name.
 	appName := filepath.Base(args[0])
 
-	if env.Get("_MINIO_DEBUG_NO_EXIT", "") != "" {
+	if debugNoExit {
 		freeze := func(_ int) {
 			// Infinite blocking op
 			<-make(chan struct{})

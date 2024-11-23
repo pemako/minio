@@ -98,12 +98,6 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
 }
 
 func TestDownloadURL(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
-
 	minioVersion1 := releaseTimeToReleaseTag(UTCNow())
 	durl := getDownloadURL(minioVersion1)
 	if IsDocker() {
@@ -164,9 +158,6 @@ func TestUserAgent(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		sci := globalIsCICD
-		globalIsCICD = false
-
 		if testCase.envName != "" {
 			t.Setenv(testCase.envName, testCase.envValue)
 			if testCase.envName == "MESOS_CONTAINER_NAME" {
@@ -182,7 +173,6 @@ func TestUserAgent(t *testing.T) {
 		if !strings.Contains(str, expectedStr) {
 			t.Errorf("Test %d: expected: %s, got: %s", i+1, expectedStr, str)
 		}
-		globalIsCICD = sci
 		os.Unsetenv("MARATHON_APP_LABEL_DCOS_PACKAGE_VERSION")
 		os.Unsetenv(testCase.envName)
 	}
@@ -190,12 +180,6 @@ func TestUserAgent(t *testing.T) {
 
 // Tests if the environment we are running is in DCOS.
 func TestIsDCOS(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
-
 	t.Setenv("MESOS_CONTAINER_NAME", "mesos-1111")
 	dcos := IsDCOS()
 	if !dcos {
@@ -210,12 +194,6 @@ func TestIsDCOS(t *testing.T) {
 
 // Tests if the environment we are running is in kubernetes.
 func TestIsKubernetes(t *testing.T) {
-	sci := globalIsCICD
-	globalIsCICD = false
-	defer func() {
-		globalIsCICD = sci
-	}()
-
 	t.Setenv("KUBERNETES_SERVICE_HOST", "10.11.148.5")
 	kubernetes := IsKubernetes()
 	if !kubernetes {
@@ -290,7 +268,7 @@ func TestDownloadReleaseData(t *testing.T) {
 	}{
 		{httpServer1.URL, "", nil},
 		{httpServer2.URL, "fbe246edbd382902db9a4035df7dce8cb441357d minio.RELEASE.2016-10-07T01-16-39Z\n", nil},
-		{httpServer3.URL, "", fmt.Errorf("Error downloading URL " + httpServer3.URL + ". Response: 404 Not Found")},
+		{httpServer3.URL, "", fmt.Errorf("Error downloading URL %s. Response: 404 Not Found", httpServer3.URL)},
 	}
 
 	for _, testCase := range testCases {

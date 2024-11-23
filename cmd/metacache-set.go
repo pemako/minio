@@ -391,7 +391,7 @@ func (r *metacacheReader) filter(o listPathOptions) (entries metaCacheEntriesSor
 			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
 				return true
 			}
-			if entry.isAllFreeVersions() {
+			if !o.InclDeleted && entry.isAllFreeVersions() {
 				return true
 			}
 			entries.o = append(entries.o, entry)
@@ -626,18 +626,18 @@ func calcCommonWritesDeletes(infos []DiskInfo, readQuorum int) (commonWrite, com
 	}
 
 	filter := func(list []uint64) (commonCount uint64) {
-		max := 0
+		maxCnt := 0
 		signatureMap := map[uint64]int{}
 		for _, v := range list {
 			signatureMap[v]++
 		}
 		for ops, count := range signatureMap {
-			if max < count && commonCount < ops {
-				max = count
+			if maxCnt < count && commonCount < ops {
+				maxCnt = count
 				commonCount = ops
 			}
 		}
-		if max < readQuorum {
+		if maxCnt < readQuorum {
 			return 0
 		}
 		return commonCount
@@ -650,7 +650,7 @@ func calcCommonWritesDeletes(infos []DiskInfo, readQuorum int) (commonWrite, com
 
 func calcCommonCounter(infos []DiskInfo, readQuorum int) (commonCount uint64) {
 	filter := func() (commonCount uint64) {
-		max := 0
+		maxCnt := 0
 		signatureMap := map[uint64]int{}
 		for _, info := range infos {
 			if info.Error != "" {
@@ -660,12 +660,12 @@ func calcCommonCounter(infos []DiskInfo, readQuorum int) (commonCount uint64) {
 			signatureMap[mutations]++
 		}
 		for ops, count := range signatureMap {
-			if max < count && commonCount < ops {
-				max = count
+			if maxCnt < count && commonCount < ops {
+				maxCnt = count
 				commonCount = ops
 			}
 		}
-		if max < readQuorum {
+		if maxCnt < readQuorum {
 			return 0
 		}
 		return commonCount
@@ -803,6 +803,17 @@ func (m *metaCacheRPC) setErr(err string) {
 	}
 	meta, _ = m.o.updateMetacacheListing(meta, m.rpc)
 	*m.meta = meta
+}
+
+// getErr will return an error if the listing failed.
+// The error is not type safe.
+func (m *metaCacheRPC) getErr() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.meta.status == scanStateError {
+		return errors.New(m.meta.error)
+	}
+	return nil
 }
 
 func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCacheRPC, entries <-chan metaCacheEntry) (err error) {

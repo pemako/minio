@@ -113,6 +113,8 @@ type ObjectOptions struct {
 	// participating in a rebalance operation. Typically set for 'write' operations.
 	SkipRebalancing bool
 
+	SrcPoolIdx int // set by PutObject/CompleteMultipart operations due to rebalance; used to prevent rebalance src, dst pools to be the same
+
 	DataMovement bool // indicates an going decommisionning or rebalacing
 
 	PrefixEnabledFn func(prefix string) bool // function which returns true if versioning is enabled on prefix
@@ -143,6 +145,7 @@ type WalkOptions struct {
 	LatestOnly   bool                     // returns only latest versions for all matching objects
 	AskDisks     string                   // dictates how many disks are being listed
 	VersionsSort WalkVersionsSortOrder    // sort order for versions of the same object; default: Ascending order in ModTime
+	Limit        int                      // maximum number of items, 0 means no limit
 }
 
 // ExpirationOptions represents object options for object expiration at objectLayer.
@@ -179,8 +182,9 @@ type DeleteBucketOptions struct {
 
 // BucketOptions provides options for ListBuckets and GetBucketInfo call.
 type BucketOptions struct {
-	Deleted bool // true only when site replication is enabled
-	Cached  bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	Deleted    bool // true only when site replication is enabled
+	Cached     bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	NoMetadata bool
 }
 
 // SetReplicaStatus sets replica status and timestamp for delete operations in ObjectOptions

@@ -8,12 +8,20 @@ import (
 	"github.com/minio/minio/internal/logger"
 )
 
+func proxyLogIf(ctx context.Context, err error, errKind ...interface{}) {
+	logger.LogIf(ctx, "proxy", err, errKind...)
+}
+
 func replLogIf(ctx context.Context, err error, errKind ...interface{}) {
 	logger.LogIf(ctx, "replication", err, errKind...)
 }
 
 func replLogOnceIf(ctx context.Context, err error, id string, errKind ...interface{}) {
 	logger.LogOnceIf(ctx, "replication", err, id, errKind...)
+}
+
+func iamLogOnceIf(ctx context.Context, err error, id string, errKind ...interface{}) {
+	logger.LogOnceIf(ctx, "iam", err, id, errKind...)
 }
 
 func iamLogIf(ctx context.Context, err error, errKind ...interface{}) {
@@ -174,10 +182,6 @@ func etcdLogIf(ctx context.Context, err error, errKind ...interface{}) {
 
 func etcdLogOnceIf(ctx context.Context, err error, id string, errKind ...interface{}) {
 	logger.LogOnceIf(ctx, "etcd", err, id, errKind...)
-}
-
-func subnetLogIf(ctx context.Context, err error, errKind ...interface{}) {
-	logger.LogIf(ctx, "subnet", err, errKind...)
 }
 
 func metricsLogIf(ctx context.Context, err error, errKind ...interface{}) {

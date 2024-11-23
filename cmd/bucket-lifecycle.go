@@ -71,7 +71,8 @@ func NewLifecycleSys() *LifecycleSys {
 	return &LifecycleSys{}
 }
 
-func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event string) madmin.TraceInfo {
+func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event string, metadata map[string]string, err string) madmin.TraceInfo {
+	sz, _ := oi.GetActualSize()
 	return madmin.TraceInfo{
 		TraceType: madmin.TraceILM,
 		Time:      startTime,
@@ -79,18 +80,23 @@ func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event 
 		FuncName:  event,
 		Duration:  duration,
 		Path:      pathJoin(oi.Bucket, oi.Name),
-		Error:     "",
+		Bytes:     sz,
+		Error:     err,
 		Message:   getSource(4),
-		Custom:    map[string]string{"version-id": oi.VersionID},
+		Custom:    metadata,
 	}
 }
 
-func (sys *LifecycleSys) trace(oi ObjectInfo) func(event string) {
+func (sys *LifecycleSys) trace(oi ObjectInfo) func(event string, metadata map[string]string, err error) {
 	startTime := time.Now()
-	return func(event string) {
+	return func(event string, metadata map[string]string, err error) {
 		duration := time.Since(startTime)
 		if globalTrace.NumSubscribers(madmin.TraceILM) > 0 {
-			globalTrace.Publish(ilmTrace(startTime, duration, oi, event))
+			e := ""
+			if err != nil {
+				e = err.Error()
+			}
+			globalTrace.Publish(ilmTrace(startTime, duration, oi, event, metadata, e))
 		}
 	}
 }
@@ -277,6 +283,10 @@ func (es *expiryState) getWorkerCh(h uint64) chan<- expiryOp {
 }
 
 func (es *expiryState) ResizeWorkers(n int) {
+	if n == 0 {
+		n = 100
+	}
+
 	// Lock to avoid multiple resizes to happen at the same time.
 	es.mu.Lock()
 	defer es.mu.Unlock()
@@ -342,7 +352,7 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 				traceFn := globalLifecycleSys.trace(oi)
 				if !oi.TransitionedObject.FreeVersion {
 					// nothing to be done
-					return
+					continue
 				}
 
 				ignoreNotFoundErr := func(err error) error {
@@ -356,7 +366,8 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 				err := deleteObjectFromRemoteTier(es.ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
 				if ignoreNotFoundErr(err) != nil {
 					transitionLogIf(es.ctx, err)
-					return
+					traceFn(ILMFreeVersionDelete, nil, err)
+					continue
 				}
 
 				// Remove this free version
@@ -538,6 +549,10 @@ func (t *transitionState) UpdateWorkers(n int) {
 }
 
 func (t *transitionState) updateWorkers(n int) {
+	if n == 0 {
+		n = 100
+	}
+
 	for t.numWorkers < n {
 		go t.worker(t.objAPI)
 		t.numWorkers++
@@ -573,6 +588,10 @@ func enqueueTransitionImmediate(obj ObjectInfo, src lcEventSrc) {
 	if lc, err := globalLifecycleSys.Get(obj.Bucket); err == nil {
 		switch event := lc.Eval(obj.ToLifecycleOpts()); event.Action {
 		case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
+			if obj.DeleteMarker || obj.IsDir {
+				// nothing to transition
+				return
+			}
 			globalTransitionState.queueTransitionTask(obj, event, src)
 		}
 	}
@@ -693,6 +712,11 @@ type auditTierOp struct {
 	Error            string `json:"error,omitempty"`
 }
 
+func (op auditTierOp) String() string {
+	// flattening the auditTierOp{} for audit
+	return fmt.Sprintf("tier:%s,respNS:%d,tx:%d,err:%s", op.Tier, op.TimeToResponseNS, op.OutputBytes, op.Error)
+}
+
 func auditTierActions(ctx context.Context, tier string, bytes int64) func(err error) {
 	startTime := time.Now()
 	return func(err error) {
@@ -716,7 +740,7 @@ func auditTierActions(ctx context.Context, tier string, bytes int64) func(err er
 			globalTierMetrics.logFailure(tier)
 		}
 
-		logger.GetReqInfo(ctx).AppendTags("tierStats", op)
+		logger.GetReqInfo(ctx).AppendTags("tierStats", op.String())
 	}
 }
 
@@ -727,7 +751,7 @@ func getTransitionedObjectReader(ctx context.Context, bucket, object string, rs 
 		return nil, fmt.Errorf("transition storage class not configured: %w", err)
 	}
 
-	fn, off, length, err := NewGetObjectReader(rs, oi, opts)
+	fn, off, length, err := NewGetObjectReader(rs, oi, opts, h)
 	if err != nil {
 		return nil, ErrorRespToObjectError(err, bucket, object)
 	}
@@ -984,7 +1008,7 @@ func ongoingRestoreObj() restoreObjStatus {
 	}
 }
 
-// completeRestoreObj constructs restoreObjStatus for a completed restore-object with given expiry.
+// completedRestoreObj constructs restoreObjStatus for a completed restore-object with given expiry.
 func completedRestoreObj(expiry time.Time) restoreObjStatus {
 	return restoreObjStatus{
 		ongoing: false,
